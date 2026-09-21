@@ -1,8 +1,8 @@
-import { createHmac, timingSafeEqual } from "node:crypto";
 import { createServer, type Server } from "node:http";
 import type { Readable } from "node:stream";
 import type { Dilemma, Option, Outcome, Verdict } from "./domain.js";
 import { errorMessage, percent } from "./format.js";
+import { deriveUnlockKey, isPassphrase, isUnlocked, unlockCookie } from "./gate.js";
 
 /** The parts of an HTTP request the shell looks at. `cookie` is the raw Cookie header; `body` the raw stream. */
 export interface Request {
@@ -27,6 +27,8 @@ export interface ServeDeps {
   readonly passphrase: string;
   /** Cap on the request body. A Dilemma is a few sentences; anything larger is a mistake. */
   readonly maxBodyBytes?: number;
+  /** Clock for cookie expiry. Defaults to the wall clock. */
+  readonly now?: () => Date;
 }
 
 export const DEFAULT_MAX_BODY_BYTES = 8 * 1024;
@@ -38,10 +40,9 @@ export const DEFAULT_PORT = 3000;
  * a constant and not config: raising it should be a code change someone reads.
  */
 export const MAX_RUNS_IN_FLIGHT = 2;
+/** What the busy page tells the browser to wait before retrying, in seconds. */
+const BUSY_RETRY_AFTER_SECONDS = 30;
 
-const COOKIE_NAME = "indecision";
-/** How long a correct passphrase stays good for, in seconds: 30 days. */
-const COOKIE_MAX_AGE_SECONDS = 30 * 24 * 60 * 60;
 const UNLOCK_PATH = "/unlock";
 
 /** `indecision serve` starts the server. Only the whole first word is reserved: "serve or rest?" is a Dilemma. */
@@ -117,7 +118,8 @@ export function startServer({ port, ...deps }: ServeOptions): Promise<Server> {
  */
 export function createHandler(deps: ServeDeps): Handler {
   const maxBodyBytes = deps.maxBodyBytes ?? DEFAULT_MAX_BODY_BYTES;
-  const token = sessionToken(deps.passphrase);
+  const now = deps.now ?? (() => new Date());
+  const key = deriveUnlockKey(deps.passphrase);
   let runsInFlight = 0;
 
   return async (request) => {
@@ -125,13 +127,15 @@ export function createHandler(deps: ServeDeps): Handler {
     if (path === UNLOCK_PATH) {
       if (request.method !== "POST") return failure(405, "Enter the passphrase with the form.");
       const form = await readBody(request.body, maxBodyBytes);
-      const offered = form === undefined ? "" : (new URLSearchParams(form).get("passphrase") ?? "");
-      if (!sameSecret(sessionToken(offered), token)) return passphrasePage("Wrong passphrase.");
-      return { status: 303, html: "", headers: { Location: "/", "Set-Cookie": sessionCookie(token) } };
+      if (form === undefined) return failure(413, "That is far too long to be the passphrase.");
+      const offered = new URLSearchParams(form).get("passphrase")?.trim() ?? "";
+      if (!(await isPassphrase(offered, await key))) return passphrasePage("Wrong passphrase.");
+      const headers = { Location: "/", "Set-Cookie": unlockCookie(await key, now()) };
+      return { status: 303, html: "", headers };
     }
     if (path !== "/") return failure(404, "There is nothing at that address; the page is at /.");
 
-    if (!sameSecret(readCookie(request.cookie, COOKIE_NAME), token)) return passphrasePage();
+    if (!isUnlocked(request.cookie, await key, now())) return passphrasePage();
     if (request.method === "GET" || request.method === "HEAD") return reply({ dilemma: "" });
     if (request.method !== "POST") return failure(405, "Submit the Dilemma with the form.");
 
@@ -143,7 +147,10 @@ export function createHandler(deps: ServeDeps): Handler {
     if (dilemma === "") return failure(400, "No Dilemma given. Type one in the box.");
 
     if (runsInFlight >= MAX_RUNS_IN_FLIGHT) {
-      return failure(503, "The server is busy deciding for someone else; try again in a moment.", dilemma);
+      return {
+        ...failure(503, "The server is busy deciding for someone else; try again in a moment.", dilemma),
+        headers: { "Retry-After": String(BUSY_RETRY_AFTER_SECONDS) },
+      };
     }
     runsInFlight += 1;
     try {
@@ -154,35 +161,6 @@ export function createHandler(deps: ServeDeps): Handler {
       runsInFlight -= 1;
     }
   };
-}
-
-/**
- * What the cookie carries: a keyed hash of the passphrase, never the passphrase itself. It is the
- * same across restarts, so a cookie outlives the process, and a leaked cookie does not reveal the
- * passphrase. The transport is plain HTTP, so a passive observer gets the cookie anyway.
- */
-function sessionToken(passphrase: string): string {
-  return createHmac("sha256", passphrase).update("indecision session").digest("hex");
-}
-
-/** Constant-time comparison; both sides are hex digests of equal length unless one is missing. */
-function sameSecret(offered: string | undefined, expected: string): boolean {
-  if (offered === undefined || offered.length !== expected.length) return false;
-  return timingSafeEqual(Buffer.from(offered), Buffer.from(expected));
-}
-
-/** Not `Secure`: the transport is plain HTTP for now, and a Secure cookie would never be sent. */
-function sessionCookie(token: string): string {
-  return `${COOKIE_NAME}=${token}; Max-Age=${COOKIE_MAX_AGE_SECONDS}; Path=/; HttpOnly; SameSite=Lax`;
-}
-
-function readCookie(header: string | undefined, name: string): string | undefined {
-  for (const pair of header?.split(";") ?? []) {
-    const at = pair.indexOf("=");
-    if (at === -1) continue;
-    if (pair.slice(0, at).trim() === name) return pair.slice(at + 1).trim();
-  }
-  return undefined;
 }
 
 /**

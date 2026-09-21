@@ -40,7 +40,7 @@ INDECISION_PASSPHRASE='open sesame' PORT=8080 indecision serve    # any other po
 
 Both API keys live on the machine that runs `serve`, so the page is behind one shared passphrase, `INDECISION_PASSPHRASE`. `serve` exits with an error before binding the port when it is unset; the CLI never needs it. There are no accounts and nothing per-person: everyone who knows the passphrase is the same visitor.
 
-A request without a valid cookie sees the passphrase page. Entering the right passphrase sets a cookie good for 30 days and lands on the Dilemma page; a wrong one shows the passphrase page again. There is no logout; to revoke every cookie at once, change the passphrase and restart. The cookie holds a keyed hash of the passphrase, never the passphrase itself, and is not marked `Secure` because the transport is plain HTTP.
+A request without a valid cookie sees the passphrase page. Entering the right passphrase sets a cookie good for 30 days and lands on the Dilemma page; a wrong one shows the passphrase page again. There is no logout; to revoke every cookie before it expires, change the passphrase and restart. The cookie holds an expiry signed with a key stretched from the passphrase (scrypt), never the passphrase itself; the server refuses it after the 30 days too, not only the browser. It is not marked `Secure` because the transport is plain HTTP.
 
 ### The run cap
 

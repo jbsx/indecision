@@ -27,23 +27,45 @@ const outcome: Outcome = {
   },
 };
 
-function handler(decide = async (_: string) => outcome, maxBodyBytes?: number): Handler {
-  return createHandler(
-    maxBodyBytes === undefined
-      ? { decide, passphrase: PASSPHRASE }
-      : { decide, passphrase: PASSPHRASE, maxBodyBytes },
-  );
+function handler(
+  decide = async (_: string) => outcome,
+  maxBodyBytes?: number,
+  now?: () => Date,
+): Handler {
+  return createHandler({
+    decide,
+    passphrase: PASSPHRASE,
+    ...(maxBodyBytes === undefined ? {} : { maxBodyBytes }),
+    ...(now === undefined ? {} : { now }),
+  });
+}
+
+function postForm(handle: Handler, url: string, fields: Record<string, string>, cookie?: string) {
+  const form = new URLSearchParams(fields).toString();
+  return handle({ method: "POST", url, cookie, body: Readable.from([form]) });
 }
 
 function unlock(handle: Handler, passphrase: string): Promise<Reply> {
-  const form = new URLSearchParams({ passphrase }).toString();
-  return handle({ method: "POST", url: "/unlock", body: Readable.from([form]) });
+  return postForm(handle, "/unlock", { passphrase });
 }
 
-/** The cookie the server itself issued for the right passphrase, as a browser would send it back. */
-async function cookieFor(handle: Handler): Promise<string> {
-  const reply = await unlock(handle, PASSPHRASE);
+function postDilemma(handle: Handler, dilemma: string, cookie?: string): Promise<Reply> {
+  return postForm(handle, "/", { dilemma }, cookie);
+}
+
+/** The Dilemma page, as a browser holding `cookie` would ask for it. */
+function open(handle: Handler, cookie?: string): Promise<Reply> {
+  return handle({ method: "GET", url: "/", cookie, body: Readable.from([]) });
+}
+
+/** The `name=value` part of a Set-Cookie, as a browser would send it back. */
+function cookieValue(reply: Reply): string {
   return reply.headers?.["Set-Cookie"]?.split(";")[0] ?? "";
+}
+
+/** The cookie the server itself issued for the right passphrase. */
+async function cookieFor(handle: Handler): Promise<string> {
+  return cookieValue(await unlock(handle, PASSPHRASE));
 }
 
 async function get(url = "/", handle = handler()): Promise<Reply> {
@@ -57,18 +79,12 @@ async function post(
   maxBodyBytes?: number,
 ): Promise<Reply> {
   const handle = handler(decide, maxBodyBytes);
-  const cookie = await cookieFor(handle);
-  return postDilemma(handle, body, cookie);
-}
-
-function postDilemma(handle: Handler, body: string, cookie?: string): Promise<Reply> {
-  const form = new URLSearchParams({ dilemma: body }).toString();
-  return handle({ method: "POST", url: "/", cookie, body: Readable.from([form]) });
+  return postDilemma(handle, body, await cookieFor(handle));
 }
 
 describe("the passphrase gate", () => {
   it("shows the passphrase page, not the Dilemma page, to a request without a cookie", async () => {
-    const reply = await handler()({ method: "GET", url: "/", body: Readable.from([]) });
+    const reply = await open(handler());
 
     expect(reply.status).toBe(401);
     expect(reply.html).toContain('<input type="password" name="passphrase"');
@@ -100,10 +116,46 @@ describe("the passphrase gate", () => {
     expect(setCookie).toMatch(/Path=\//);
     expect(setCookie).not.toMatch(/Secure/);
 
-    const cookie = setCookie.split(";")[0] ?? "";
-    const page = await handle({ method: "GET", url: "/", cookie, body: Readable.from([]) });
+    const page = await open(handle, cookieValue(unlocked));
     expect(page.status).toBe(200);
     expect(page.html).toContain('<textarea name="dilemma"');
+  });
+
+  it("accepts the passphrase with stray whitespace around it", async () => {
+    const reply = await unlock(handler(), `  ${PASSPHRASE}\n`);
+
+    expect(reply.status).toBe(303);
+  });
+
+  it("rejects an over-cap unlock body as too long rather than as a wrong passphrase", async () => {
+    const reply = await unlock(handler(async () => outcome, 100), "x".repeat(200));
+
+    expect(reply.status).toBe(413);
+    expect(reply.html).not.toContain("Wrong passphrase");
+  });
+
+  it("stops honouring the cookie after 30 days", async () => {
+    const issuedAt = new Date("2026-09-21T12:00:00Z");
+    let clock = issuedAt;
+    const handle = handler(undefined, undefined, () => clock);
+    const cookie = await cookieFor(handle);
+
+    clock = new Date(issuedAt.getTime() + 29 * 24 * 60 * 60 * 1000);
+    expect((await open(handle, cookie)).status).toBe(200);
+
+    clock = new Date(issuedAt.getTime() + 30 * 24 * 60 * 60 * 1000 + 1000);
+    expect((await open(handle, cookie)).status).toBe(401);
+  });
+
+  it("rejects a cookie whose expiry was pushed out without the server's signature", async () => {
+    const handle = handler();
+    const cookie = await cookieFor(handle);
+    const [name, token] = cookie.split("=") as [string, string];
+    const [expires, signature] = token.split(".") as [string, string];
+
+    const later = await open(handle, `${name}=${Number(expires) + 86400}.${signature}`);
+
+    expect(later.status).toBe(401);
   });
 
   it("does not decide a Dilemma submitted without a cookie", async () => {
@@ -120,25 +172,15 @@ describe("the passphrase gate", () => {
     expect(seen).toEqual([]);
   });
 
-  it("finds its cookie among others and rejects a forged one", async () => {
+  it("finds its cookie among others and rejects a forged one, even a non-ASCII one", async () => {
     const handle = handler();
     const cookie = await cookieFor(handle);
+    const [name, token] = cookie.split("=") as [string, string];
+    const [expires, signature] = token.split(".") as [string, string];
 
-    const withOthers = await handle({
-      method: "GET",
-      url: "/",
-      cookie: `theme=dark; ${cookie}; lang=en`,
-      body: Readable.from([]),
-    });
-    expect(withOthers.status).toBe(200);
-
-    const forged = await handle({
-      method: "GET",
-      url: "/",
-      cookie: `${cookie.split("=")[0]}=not-the-real-value`,
-      body: Readable.from([]),
-    });
-    expect(forged.status).toBe(401);
+    expect((await open(handle, `theme=dark; ${cookie}; lang=en`)).status).toBe(200);
+    expect((await open(handle, `${name}=not-the-real-value`)).status).toBe(401);
+    expect((await open(handle, `${name}=${expires}.${"é".repeat(signature.length)}`)).status).toBe(401);
   });
 });
 
@@ -178,6 +220,7 @@ describe("the run cap", () => {
     const third = await postDilemma(handle, "walk or bus?", cookie);
 
     expect(third.status).toBe(503);
+    expect(third.headers?.["Retry-After"]).toMatch(/^\d+$/);
     expect(third.html).toContain("busy");
     expect(third.html).toContain("try again");
     expect(third.html).toContain(">walk or bus?</textarea>");
