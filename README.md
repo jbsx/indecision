@@ -25,12 +25,23 @@ echo "gym or rest?" | node dist/main.js
 
 The Verdict is printed first, then the Cases. A close call is flagged when the top two probabilities are within 0.1 of each other. Every successful run is appended as one JSON line to `indecision/log.jsonl` under your user data directory (`$XDG_DATA_HOME` on Linux, defaulting to `~/.local/share`).
 
+## Use from a browser
+
+```sh
+indecision serve              # listens on 0.0.0.0:3000
+PORT=8080 indecision serve    # any other port
+```
+
+`indecision serve` starts a plain HTTP server on all interfaces, on the port in `PORT` (default 3000), using the same Advocate, Judge and Log as the CLI. The page has one box for the Dilemma. Submitting it shows the Verdict first (pick, a probability per Option, confidence, and the close-call line when flagged), then every Case, expanded. A Refusal is shown as an outcome with its reason, and the Dilemma stays in the box so it can be reworded. An adapter or network failure shows as an error banner. The body is capped at 8 KiB.
+
+`serve` is a reserved first word: `indecision serve` never starts a Dilemma. Quote it as part of a longer sentence (`indecision "serve or return?"`) and it is a Dilemma again. Nothing per-person is stored; the server appends to the same shared log file as the CLI.
+
 ## Develop
 
 ```sh
-pnpm test        # unit suite: the pipeline with scripted ports, and the CLI shell
+pnpm test        # unit suite: the pipeline with scripted ports, the CLI shell, and the HTTP shell
 pnpm typecheck
 pnpm smoke       # runs the real Advocate and real Judge on a sample Dilemma; needs both keys
 ```
 
-The pipeline (`src/decide.ts`) takes the Advocate, Judge and Log as injected ports. The real adapters live in `src/advocate`, `src/judge` and `src/log` and are covered only by the smoke script.
+The pipeline (`src/decide.ts`) takes the Advocate, Judge and Log as injected ports. Both shells (`src/cli.ts` and `src/serve.ts`) take an injected `decide` and are unit-tested without touching an adapter or binding a port. The real adapters live in `src/advocate`, `src/judge` and `src/log` and are covered only by the smoke script.
