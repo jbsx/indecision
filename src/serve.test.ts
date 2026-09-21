@@ -1,7 +1,16 @@
 import { Readable } from "node:stream";
 import { describe, expect, it } from "vitest";
+import type { Stage } from "./decide.js";
 import type { Outcome } from "./domain.js";
-import { handle, isServeCommand, readPort, type Reply } from "./serve.js";
+import {
+  handle,
+  isServeCommand,
+  readPort,
+  type Page,
+  type ProgressEvent,
+  type Reply,
+  type ServeDeps,
+} from "./serve.js";
 
 const outcome: Outcome = {
   refused: false,
@@ -17,20 +26,57 @@ const outcome: Outcome = {
   },
 };
 
-function get(url = "/", decide = async (_: string) => outcome): Promise<Reply> {
-  return handle({ method: "GET", url, body: Readable.from([]) }, { decide });
+type Decide = ServeDeps["decide"];
+
+function page(reply: Reply): Page {
+  if (!("html" in reply)) throw new Error("expected a whole page, got a stream");
+  return reply;
 }
 
-function post(
+async function get(url = "/", decide: Decide = async () => outcome): Promise<Page> {
+  return page(await handle({ method: "GET", url, body: Readable.from([]) }, { decide }));
+}
+
+async function post(
   body: string,
-  decide = async (_: string) => outcome,
+  decide: Decide = async () => outcome,
   maxBodyBytes?: number,
-): Promise<Reply> {
+): Promise<Page> {
   const form = new URLSearchParams({ dilemma: body }).toString();
-  return handle(
-    { method: "POST", url: "/", body: Readable.from([form]) },
+  return page(
+    await handle(
+      { method: "POST", url: "/", body: Readable.from([form]) },
+      maxBodyBytes === undefined ? { decide } : { decide, maxBodyBytes },
+    ),
+  );
+}
+
+/** POSTs to the streamed route and collects what it sends, in order. */
+async function stream(
+  body: string,
+  decide: Decide = async () => outcome,
+  maxBodyBytes?: number,
+): Promise<{ status: number; events: ProgressEvent[] }> {
+  const form = new URLSearchParams({ dilemma: body }).toString();
+  const reply = await handle(
+    { method: "POST", url: "/decide", body: Readable.from([form]) },
     maxBodyBytes === undefined ? { decide } : { decide, maxBodyBytes },
   );
+  if ("html" in reply) throw new Error("expected a stream, got a whole page");
+  const events: ProgressEvent[] = [];
+  await reply.run((event) => {
+    events.push(event);
+  });
+  return { status: reply.status, events };
+}
+
+/** A `decide` that fires both stages, as the real pipeline does, before settling. */
+function staged(settle: () => Promise<Outcome>): Decide {
+  return async (_, onStage) => {
+    onStage("advocate");
+    onStage("judge");
+    return settle();
+  };
 }
 
 describe("indecision serve", () => {
@@ -156,6 +202,143 @@ describe("indecision serve", () => {
     const reply = await get("/favicon.ico");
 
     expect(reply.status).toBe(404);
+  });
+
+  it("gives the page a script that submits to the streamed route and slots for the banner and outcome", async () => {
+    const reply = await get();
+
+    expect(reply.html).toContain('fetch("/decide"');
+    expect(reply.html).toContain('id="banner"');
+    expect(reply.html).toContain('id="outcome"');
+  });
+});
+
+describe("the streamed route", () => {
+  it("sends the Advocate stage, then the Judge stage, then the Verdict above the Cases", async () => {
+    const seen: string[] = [];
+    const { status, events } = await stream(
+      "gym or rest?",
+      async (dilemma, onStage) => {
+        seen.push(dilemma);
+        onStage("advocate");
+        seen.push("argue");
+        onStage("judge");
+        seen.push("judge");
+        return outcome;
+      },
+    );
+
+    expect(status).toBe(200);
+    expect(seen).toEqual(["gym or rest?", "argue", "judge"]);
+    expect(events).toHaveLength(3);
+    expect(events[0]).toEqual({ stage: "advocate", text: "The Advocate is arguing…" });
+    expect(events[1]).toEqual({ stage: "judge", text: "The Judge is weighing…" });
+    const last = events[2];
+    if (last === undefined || !("outcome" in last)) throw new Error("expected an outcome last");
+    const verdictAt = last.outcome.indexOf("Verdict");
+    const casesAt = last.outcome.indexOf("Cases");
+    expect(verdictAt).toBeGreaterThanOrEqual(0);
+    expect(casesAt).toBeGreaterThan(verdictAt);
+    expect(last.outcome).toContain("80.0%");
+    expect(last.outcome).toContain("<details open>");
+  });
+
+  it("sends each stage as it happens, not only once the outcome is in", async () => {
+    let release = () => {};
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const form = new URLSearchParams({ dilemma: "gym or rest?" }).toString();
+    const reply = await handle(
+      { method: "POST", url: "/decide", body: Readable.from([form]) },
+      {
+        decide: async (_, onStage) => {
+          onStage("advocate");
+          await gate;
+          onStage("judge");
+          return outcome;
+        },
+      },
+    );
+    if ("html" in reply) throw new Error("expected a stream");
+
+    const stages: Stage[] = [];
+    const finished = reply.run((event) => {
+      if ("stage" in event) stages.push(event.stage);
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(stages).toEqual(["advocate"]);
+
+    release();
+    await finished;
+    expect(stages).toEqual(["advocate", "judge"]);
+  });
+
+  it("sends a Refusal as an outcome after the stages", async () => {
+    const { status, events } = await stream(
+      "I feel stuck",
+      staged(async () => ({ refused: true, reason: "No Options are named." })),
+    );
+
+    expect(status).toBe(200);
+    expect(events.map((event) => Object.keys(event)[0])).toEqual(["stage", "stage", "outcome"]);
+    const last = events[2];
+    if (last === undefined || !("outcome" in last)) throw new Error("expected an outcome last");
+    expect(last.outcome).toContain("No Options are named.");
+    expect(last.outcome).not.toContain("Verdict");
+    expect(last.outcome).not.toContain('class="error"');
+  });
+
+  it("sends a thrown error as a banner after the stages", async () => {
+    const { status, events } = await stream(
+      "gym or rest?",
+      staged(async () => {
+        throw new Error("jev unreachable");
+      }),
+    );
+
+    expect(status).toBe(200);
+    expect(events.map((event) => Object.keys(event)[0])).toEqual(["stage", "stage", "error"]);
+    const last = events[2];
+    if (last === undefined || !("error" in last)) throw new Error("expected an error last");
+    expect(last.error).toContain('class="error"');
+    expect(last.error).toContain("jev unreachable");
+  });
+
+  it("rejects a body over the cap with an error and never calls decide", async () => {
+    const seen: string[] = [];
+    const { status, events } = await stream(
+      "x".repeat(200),
+      async (dilemma) => {
+        seen.push(dilemma);
+        return outcome;
+      },
+      100,
+    );
+
+    expect(status).toBe(413);
+    expect(seen).toEqual([]);
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({ error: expect.stringContaining("too long") });
+  });
+
+  it("asks for a Dilemma when the box is empty instead of calling decide", async () => {
+    const seen: string[] = [];
+    const { status, events } = await stream("   ", async (dilemma) => {
+      seen.push(dilemma);
+      return outcome;
+    });
+
+    expect(status).toBe(400);
+    expect(seen).toEqual([]);
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({ error: expect.stringContaining("No Dilemma given") });
+  });
+
+  it("answers a GET on the streamed route with 405", async () => {
+    const reply = await get("/decide");
+
+    expect(reply.status).toBe(405);
   });
 });
 

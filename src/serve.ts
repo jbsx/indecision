@@ -1,5 +1,6 @@
 import { createServer, type Server } from "node:http";
 import type { Readable } from "node:stream";
+import type { Stage } from "./decide.js";
 import type { Dilemma, Option, Outcome, Verdict } from "./domain.js";
 import { errorMessage, percent } from "./format.js";
 
@@ -10,14 +11,34 @@ export interface Request {
   readonly body: Readable;
 }
 
-/** An HTML page with a status. The server speaks nothing else. */
-export interface Reply {
+/** A whole HTML page with a status. */
+export interface Page {
   readonly status: number;
   readonly html: string;
 }
 
+/**
+ * One step of a run as the page's script sees it: which role is at work, or the finished
+ * outcome (Verdict above Cases, or a Refusal) or the error banner, both as HTML fragments rendered
+ * exactly as the whole page would render them.
+ */
+export type ProgressEvent =
+  | { readonly stage: Stage; readonly text: string }
+  | { readonly outcome: string }
+  | { readonly error: string };
+
+/** A run's progress, handed to `send` one event at a time as it happens. Resolves once the run is over. */
+export interface Stream {
+  readonly status: number;
+  readonly run: (send: (event: ProgressEvent) => void) => Promise<void>;
+}
+
+/** What a request gets back. The form's own POST gets a Page; the page's script gets a Stream. */
+export type Reply = Page | Stream;
+
 export interface ServeDeps {
-  readonly decide: (dilemma: Dilemma) => Promise<Outcome>;
+  /** The pipeline, told where the time is going through `onStage` just before each role is asked. */
+  readonly decide: (dilemma: Dilemma, onStage: (stage: Stage) => void) => Promise<Outcome>;
   /** Cap on the request body. A Dilemma is a few sentences; anything larger is a mistake. */
   readonly maxBodyBytes?: number;
 }
@@ -43,7 +64,17 @@ export function readPort(env: NodeJS.ProcessEnv): number {
 
 /** All interfaces, so the page is reachable from another device on the network. */
 export const HOST = "0.0.0.0";
-const CONTENT_TYPE = "text/html; charset=utf-8";
+const HTML = "text/html; charset=utf-8";
+/** One JSON object per line, written as each event happens. */
+const EVENT_LINES = "application/x-ndjson; charset=utf-8";
+
+/** Where the page's script sends the Dilemma. The form itself still posts to /. */
+const STREAM_PATH = "/decide";
+
+const STAGE_TEXT: Readonly<Record<Stage, string>> = {
+  advocate: "The Advocate is arguing…",
+  judge: "The Judge is weighing…",
+};
 
 export interface ServeOptions extends ServeDeps {
   readonly port: number;
@@ -52,16 +83,25 @@ export interface ServeOptions extends ServeDeps {
 /** Binds the handler to a plain HTTP server on every interface and resolves once it is listening. */
 export function startServer({ port, ...deps }: ServeOptions): Promise<Server> {
   const server = createServer(async (req, res) => {
-    let page: Reply;
+    let reply: Reply;
     try {
-      page = await handle({ method: req.method ?? "GET", url: req.url ?? "/", body: req }, deps);
+      reply = await handle({ method: req.method ?? "GET", url: req.url ?? "/", body: req }, deps);
     } catch (error) {
       // A client that hangs up mid-request, or a request we can't parse. Never let it take the server down.
-      page = failure(500, `Something went wrong: ${errorMessage(error)}`);
+      reply = failure(500, `Something went wrong: ${errorMessage(error)}`);
     }
     if (res.writableEnded || res.destroyed) return;
-    res.writeHead(page.status, { "Content-Type": CONTENT_TYPE });
-    res.end(req.method === "HEAD" ? undefined : page.html);
+    if ("html" in reply) {
+      res.writeHead(reply.status, { "Content-Type": HTML });
+      res.end(req.method === "HEAD" ? undefined : reply.html);
+      return;
+    }
+    res.writeHead(reply.status, { "Content-Type": EVENT_LINES, "Cache-Control": "no-store" });
+    res.flushHeaders();
+    await reply.run((event) => {
+      if (!res.destroyed) res.write(JSON.stringify(event) + "\n");
+    });
+    if (!res.destroyed) res.end();
   });
   return new Promise((resolve, reject) => {
     server.once("error", reject);
@@ -72,26 +112,64 @@ export function startServer({ port, ...deps }: ServeOptions): Promise<Server> {
   });
 }
 
-/** Thin shell over `decide`: one page with a box for the Dilemma, the Outcome rendered below it. */
+/**
+ * Thin shell over `decide`: one page with a box for the Dilemma, the Outcome rendered below it.
+ * The page's script posts to the streamed route instead and gets the stages as they happen.
+ */
 export async function handle(request: Request, deps: ServeDeps): Promise<Reply> {
-  if (new URL(request.url, "http://localhost").pathname !== "/") {
-    return failure(404, "There is nothing at that address; the page is at /.");
-  }
-  if (request.method === "GET" || request.method === "HEAD") return reply({ dilemma: "" });
+  const path = new URL(request.url, "http://localhost").pathname;
+  if (path === STREAM_PATH) return handleStream(request, deps);
+  if (path !== "/") return failure(404, "There is nothing at that address; the page is at /.");
+  if (request.method === "GET" || request.method === "HEAD") return page({ dilemma: "" });
   if (request.method !== "POST") return failure(405, "Submit the Dilemma with the form.");
 
-  const form = await readBody(request.body, deps.maxBodyBytes ?? DEFAULT_MAX_BODY_BYTES);
-  if (form === undefined) {
-    return failure(413, "That Dilemma is too long. Keep it to a few sentences.");
-  }
-  const dilemma = new URLSearchParams(form).get("dilemma")?.trim() ?? "";
-  if (dilemma === "") return failure(400, "No Dilemma given. Type one in the box.");
+  const submitted = await readDilemma(request, deps);
+  if ("rejected" in submitted) return failure(submitted.status, submitted.rejected);
+  const { dilemma } = submitted;
 
   try {
-    return reply({ dilemma, outcome: await deps.decide(dilemma) });
+    return page({ dilemma, outcome: await deps.decide(dilemma, () => {}) });
   } catch (error) {
     return failure(500, `Something went wrong: ${errorMessage(error)}`, dilemma);
   }
+}
+
+async function handleStream(request: Request, deps: ServeDeps): Promise<Reply> {
+  if (request.method !== "POST") return failure(405, "Submit the Dilemma with the form.");
+
+  const submitted = await readDilemma(request, deps);
+  if ("rejected" in submitted) {
+    const banner = renderError(submitted.rejected);
+    return { status: submitted.status, run: async (send) => send({ error: banner }) };
+  }
+  const { dilemma } = submitted;
+
+  return {
+    status: 200,
+    run: async (send) => {
+      try {
+        const outcome = await deps.decide(dilemma, (stage) =>
+          send({ stage, text: STAGE_TEXT[stage] }),
+        );
+        send({ outcome: renderOutcome(outcome) });
+      } catch (error) {
+        send({ error: renderError(`Something went wrong: ${errorMessage(error)}`) });
+      }
+    },
+  };
+}
+
+type Submission = { dilemma: Dilemma } | { status: number; rejected: string };
+
+/** The Dilemma from the form body, or why the submission is rejected before deciding anything. */
+async function readDilemma(request: Request, deps: ServeDeps): Promise<Submission> {
+  const form = await readBody(request.body, deps.maxBodyBytes ?? DEFAULT_MAX_BODY_BYTES);
+  if (form === undefined) {
+    return { status: 413, rejected: "That Dilemma is too long. Keep it to a few sentences." };
+  }
+  const dilemma = new URLSearchParams(form).get("dilemma")?.trim() ?? "";
+  if (dilemma === "") return { status: 400, rejected: "No Dilemma given. Type one in the box." };
+  return { dilemma };
 }
 
 /**
@@ -123,13 +201,13 @@ interface PageState {
   readonly error?: string;
 }
 
-function reply(state: PageState, status = 200): Reply {
+function page(state: PageState, status = 200): Page {
   return { status, html: renderPage(state) };
 }
 
 /** The same page with a banner instead of an Outcome; the Dilemma stays in the box when there is one. */
-function failure(status: number, message: string, dilemma: Dilemma = ""): Reply {
-  return reply({ dilemma, error: message }, status);
+function failure(status: number, message: string, dilemma: Dilemma = ""): Page {
+  return page({ dilemma, error: message }, status);
 }
 
 function renderPage(state: PageState): string {
@@ -146,19 +224,16 @@ function renderPage(state: PageState): string {
 <body>
 <main>
 <h1>indecision</h1>
-${banner}<form method="post" action="/">
+<div id="banner">${banner}</div>
+<form method="post" action="/">
 <label for="dilemma">What are you stuck on?</label>
 <textarea name="dilemma" id="dilemma" rows="5" required>${escape(state.dilemma)}</textarea>
 <button type="submit">Decide</button>
 <p class="waiting" hidden aria-live="polite">Deciding…</p>
 </form>
-${renderedOutcome}</main>
-<script>
-document.querySelector("form").addEventListener("submit", function (event) {
-  event.target.querySelector("button").disabled = true;
-  event.target.querySelector(".waiting").hidden = false;
-});
-</script>
+<div id="outcome">${renderedOutcome}</div>
+</main>
+<script>${SCRIPT}</script>
 </body>
 </html>
 `;
@@ -179,6 +254,61 @@ details { border: 1px solid #ddd; padding: .5rem 1rem; margin-bottom: .75rem; ba
 summary { font-weight: 600; cursor: pointer; }
 h4 { margin: .5rem 0 0; }
 ul { margin: .25rem 0; }
+`;
+
+/**
+ * Submits the Dilemma to the streamed route and shows each stage as it arrives, then the outcome
+ * or the banner, without reloading. Left alone, the form still posts to / and gets the whole page.
+ */
+const SCRIPT = `
+(function () {
+  var form = document.querySelector("form");
+  var button = form.querySelector("button");
+  var waiting = form.querySelector(".waiting");
+  var banner = document.getElementById("banner");
+  var outcome = document.getElementById("outcome");
+  if (!window.fetch || !window.ReadableStream || !window.TextDecoder) return;
+
+  form.addEventListener("submit", function (event) {
+    event.preventDefault();
+    button.disabled = true;
+    banner.innerHTML = "";
+    outcome.innerHTML = "";
+    waiting.textContent = "Deciding…";
+    waiting.hidden = false;
+    fetch("${STREAM_PATH}", { method: "POST", body: new URLSearchParams(new FormData(form)) })
+      .then(function (response) { return readLines(response.body, apply); })
+      .catch(function (error) { banner.innerHTML = ""; banner.appendChild(errorBanner(error)); })
+      .then(function () { waiting.hidden = true; button.disabled = false; });
+  });
+
+  function apply(event) {
+    if ("stage" in event) waiting.textContent = event.text;
+    else if ("outcome" in event) outcome.innerHTML = event.outcome;
+    else if ("error" in event) banner.innerHTML = event.error;
+  }
+
+  function readLines(body, onLine) {
+    var reader = body.getReader();
+    var decoder = new TextDecoder();
+    var buffered = "";
+    return reader.read().then(function step(chunk) {
+      buffered += decoder.decode(chunk.value || new Uint8Array(), { stream: !chunk.done });
+      var lines = buffered.split("\\n");
+      buffered = lines.pop();
+      lines.forEach(function (line) { if (line) onLine(JSON.parse(line)); });
+      return chunk.done ? undefined : reader.read().then(step);
+    });
+  }
+
+  function errorBanner(error) {
+    var p = document.createElement("p");
+    p.className = "error";
+    p.setAttribute("role", "alert");
+    p.textContent = "Something went wrong: " + ((error && error.message) || error);
+    return p;
+  }
+})();
 `;
 
 function renderError(message: string): string {

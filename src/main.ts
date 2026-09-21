@@ -32,7 +32,10 @@ if (isServeCommand(argv)) {
     process.exit(1);
   }
   try {
-    const server = await startServer({ port: readPort(process.env), decide: decideWithPorts });
+    const server = await startServer({
+      port: readPort(process.env),
+      decide: (dilemma, onStage) => decide(dilemma, { ...ports, onStage }),
+    });
     const address = server.address();
     const port = typeof address === "object" && address !== null ? address.port : "?";
     process.stderr.write(`indecision: listening on http://${HOST}:${port}\n`);
