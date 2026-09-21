@@ -22,7 +22,7 @@ export interface Page {
  * outcome (Verdict above Cases, or a Refusal) or the error banner, both as HTML fragments rendered
  * exactly as the whole page would render them.
  */
-export type ProgressEvent =
+export type RunEvent =
   | { readonly stage: Stage; readonly text: string }
   | { readonly outcome: string }
   | { readonly error: string };
@@ -30,7 +30,7 @@ export type ProgressEvent =
 /** A run's progress, handed to `send` one event at a time as it happens. Resolves once the run is over. */
 export interface Stream {
   readonly status: number;
-  readonly run: (send: (event: ProgressEvent) => void) => Promise<void>;
+  readonly run: (send: (event: RunEvent) => void) => Promise<void>;
 }
 
 /** What a request gets back. The form's own POST gets a Page; the page's script gets a Stream. */
@@ -38,7 +38,7 @@ export type Reply = Page | Stream;
 
 export interface ServeDeps {
   /** The pipeline, told where the time is going through `onStage` just before each role is asked. */
-  readonly decide: (dilemma: Dilemma, onStage: (stage: Stage) => void) => Promise<Outcome>;
+  readonly decide: (dilemma: Dilemma, onStage?: (stage: Stage) => void) => Promise<Outcome>;
   /** Cap on the request body. A Dilemma is a few sentences; anything larger is a mistake. */
   readonly maxBodyBytes?: number;
 }
@@ -64,9 +64,9 @@ export function readPort(env: NodeJS.ProcessEnv): number {
 
 /** All interfaces, so the page is reachable from another device on the network. */
 export const HOST = "0.0.0.0";
-const HTML = "text/html; charset=utf-8";
+const HTML_TYPE = "text/html; charset=utf-8";
 /** One JSON object per line, written as each event happens. */
-const EVENT_LINES = "application/x-ndjson; charset=utf-8";
+const NDJSON_TYPE = "application/x-ndjson; charset=utf-8";
 
 /** Where the page's script sends the Dilemma. The form itself still posts to /. */
 const STREAM_PATH = "/decide";
@@ -75,6 +75,13 @@ const STAGE_TEXT: Readonly<Record<Stage, string>> = {
   advocate: "The Advocate is arguing…",
   judge: "The Judge is weighing…",
 };
+
+const NOT_A_FORM_POST = "Submit the Dilemma with the form.";
+
+/** A thrown failure (adapter, network), worded for the person. Nothing was decided. */
+function somethingWentWrong(error: unknown): string {
+  return `Something went wrong: ${errorMessage(error)}`;
+}
 
 export interface ServeOptions extends ServeDeps {
   readonly port: number;
@@ -88,15 +95,15 @@ export function startServer({ port, ...deps }: ServeOptions): Promise<Server> {
       reply = await handle({ method: req.method ?? "GET", url: req.url ?? "/", body: req }, deps);
     } catch (error) {
       // A client that hangs up mid-request, or a request we can't parse. Never let it take the server down.
-      reply = failure(500, `Something went wrong: ${errorMessage(error)}`);
+      reply = failure(500, somethingWentWrong(error));
     }
     if (res.writableEnded || res.destroyed) return;
     if ("html" in reply) {
-      res.writeHead(reply.status, { "Content-Type": HTML });
+      res.writeHead(reply.status, { "Content-Type": HTML_TYPE });
       res.end(req.method === "HEAD" ? undefined : reply.html);
       return;
     }
-    res.writeHead(reply.status, { "Content-Type": EVENT_LINES, "Cache-Control": "no-store" });
+    res.writeHead(reply.status, { "Content-Type": NDJSON_TYPE, "Cache-Control": "no-store" });
     res.flushHeaders();
     await reply.run((event) => {
       if (!res.destroyed) res.write(JSON.stringify(event) + "\n");
@@ -121,25 +128,26 @@ export async function handle(request: Request, deps: ServeDeps): Promise<Reply> 
   if (path === STREAM_PATH) return handleStream(request, deps);
   if (path !== "/") return failure(404, "There is nothing at that address; the page is at /.");
   if (request.method === "GET" || request.method === "HEAD") return page({ dilemma: "" });
-  if (request.method !== "POST") return failure(405, "Submit the Dilemma with the form.");
+  if (request.method !== "POST") return failure(405, NOT_A_FORM_POST);
 
   const submitted = await readDilemma(request, deps);
-  if ("rejected" in submitted) return failure(submitted.status, submitted.rejected);
+  if ("reason" in submitted) return failure(submitted.status, submitted.reason);
   const { dilemma } = submitted;
 
   try {
-    return page({ dilemma, outcome: await deps.decide(dilemma, () => {}) });
+    return page({ dilemma, outcome: await deps.decide(dilemma) });
   } catch (error) {
-    return failure(500, `Something went wrong: ${errorMessage(error)}`, dilemma);
+    return failure(500, somethingWentWrong(error), dilemma);
   }
 }
 
+/** The same submission answered as a Stream: the stages as they happen, then the outcome or the banner. */
 async function handleStream(request: Request, deps: ServeDeps): Promise<Reply> {
-  if (request.method !== "POST") return failure(405, "Submit the Dilemma with the form.");
+  if (request.method !== "POST") return failure(405, NOT_A_FORM_POST);
 
   const submitted = await readDilemma(request, deps);
-  if ("rejected" in submitted) {
-    const banner = renderError(submitted.rejected);
+  if ("reason" in submitted) {
+    const banner = renderError(submitted.reason);
     return { status: submitted.status, run: async (send) => send({ error: banner }) };
   }
   const { dilemma } = submitted;
@@ -153,22 +161,29 @@ async function handleStream(request: Request, deps: ServeDeps): Promise<Reply> {
         );
         send({ outcome: renderOutcome(outcome) });
       } catch (error) {
-        send({ error: renderError(`Something went wrong: ${errorMessage(error)}`) });
+        send({ error: renderError(somethingWentWrong(error)) });
       }
     },
   };
 }
 
-type Submission = { dilemma: Dilemma } | { status: number; rejected: string };
+/** Why a submission is turned away before anything is decided, with the status that says so. */
+interface Rejection {
+  readonly status: number;
+  readonly reason: string;
+}
 
-/** The Dilemma from the form body, or why the submission is rejected before deciding anything. */
-async function readDilemma(request: Request, deps: ServeDeps): Promise<Submission> {
+/** The Dilemma from the form body, or the Rejection. */
+async function readDilemma(
+  request: Request,
+  deps: ServeDeps,
+): Promise<{ dilemma: Dilemma } | Rejection> {
   const form = await readBody(request.body, deps.maxBodyBytes ?? DEFAULT_MAX_BODY_BYTES);
   if (form === undefined) {
-    return { status: 413, rejected: "That Dilemma is too long. Keep it to a few sentences." };
+    return { status: 413, reason: "That Dilemma is too long. Keep it to a few sentences." };
   }
   const dilemma = new URLSearchParams(form).get("dilemma")?.trim() ?? "";
-  if (dilemma === "") return { status: 400, rejected: "No Dilemma given. Type one in the box." };
+  if (dilemma === "") return { status: 400, reason: "No Dilemma given. Type one in the box." };
   return { dilemma };
 }
 

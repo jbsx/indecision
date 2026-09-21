@@ -7,9 +7,10 @@ import {
   isServeCommand,
   readPort,
   type Page,
-  type ProgressEvent,
   type Reply,
+  type RunEvent,
   type ServeDeps,
+  type Stream,
 } from "./serve.js";
 
 const outcome: Outcome = {
@@ -51,19 +52,29 @@ async function post(
   );
 }
 
-/** POSTs to the streamed route and collects what it sends, in order. */
-async function stream(
+/** POSTs to the streamed route and hands back the Stream, not yet run. */
+async function open(
   body: string,
   decide: Decide = async () => outcome,
   maxBodyBytes?: number,
-): Promise<{ status: number; events: ProgressEvent[] }> {
+): Promise<Stream> {
   const form = new URLSearchParams({ dilemma: body }).toString();
   const reply = await handle(
     { method: "POST", url: "/decide", body: Readable.from([form]) },
     maxBodyBytes === undefined ? { decide } : { decide, maxBodyBytes },
   );
   if ("html" in reply) throw new Error("expected a stream, got a whole page");
-  const events: ProgressEvent[] = [];
+  return reply;
+}
+
+/** POSTs to the streamed route and collects what it sends, in order. */
+async function stream(
+  body: string,
+  decide: Decide = async () => outcome,
+  maxBodyBytes?: number,
+): Promise<{ status: number; events: RunEvent[] }> {
+  const reply = await open(body, decide, maxBodyBytes);
+  const events: RunEvent[] = [];
   await reply.run((event) => {
     events.push(event);
   });
@@ -73,8 +84,8 @@ async function stream(
 /** A `decide` that fires both stages, as the real pipeline does, before settling. */
 function staged(settle: () => Promise<Outcome>): Decide {
   return async (_, onStage) => {
-    onStage("advocate");
-    onStage("judge");
+    onStage?.("advocate");
+    onStage?.("judge");
     return settle();
   };
 }
@@ -220,9 +231,9 @@ describe("the streamed route", () => {
       "gym or rest?",
       async (dilemma, onStage) => {
         seen.push(dilemma);
-        onStage("advocate");
+        onStage?.("advocate");
         seen.push("argue");
-        onStage("judge");
+        onStage?.("judge");
         seen.push("judge");
         return outcome;
       },
@@ -248,19 +259,12 @@ describe("the streamed route", () => {
     const gate = new Promise<void>((resolve) => {
       release = resolve;
     });
-    const form = new URLSearchParams({ dilemma: "gym or rest?" }).toString();
-    const reply = await handle(
-      { method: "POST", url: "/decide", body: Readable.from([form]) },
-      {
-        decide: async (_, onStage) => {
-          onStage("advocate");
-          await gate;
-          onStage("judge");
-          return outcome;
-        },
-      },
-    );
-    if ("html" in reply) throw new Error("expected a stream");
+    const reply = await open("gym or rest?", async (_, onStage) => {
+      onStage?.("advocate");
+      await gate;
+      onStage?.("judge");
+      return outcome;
+    });
 
     const stages: Stage[] = [];
     const finished = reply.run((event) => {
