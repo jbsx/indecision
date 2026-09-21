@@ -28,13 +28,90 @@ The Verdict is printed first, then the Cases. A close call is flagged when the t
 ## Use from a browser
 
 ```sh
-indecision serve              # listens on 0.0.0.0:3000
-PORT=8080 indecision serve    # any other port
+INDECISION_PASSPHRASE='open sesame' indecision serve              # listens on 0.0.0.0:3000
+INDECISION_PASSPHRASE='open sesame' PORT=8080 indecision serve    # any other port
 ```
 
 `indecision serve` starts a plain HTTP server on all interfaces, on the port in `PORT` (default 3000), using the same Advocate, Judge and Log as the CLI. The page has one box for the Dilemma. Submitting it shows the Verdict first (pick, a probability per Option, confidence, and the close-call line when flagged), then every Case, expanded. A Refusal is shown as an outcome with its reason, and the Dilemma stays in the box so it can be reworded. An adapter or network failure shows as an error banner. The body is capped at 8 KiB.
 
 `serve` is a reserved first word: `indecision serve` never starts a Dilemma. Quote it as part of a longer sentence (`indecision "serve or return?"`) and it is a Dilemma again. Nothing per-person is stored; the server appends to the same shared log file as the CLI.
+
+### The passphrase
+
+Both API keys live on the machine that runs `serve`, so the page is behind one shared passphrase, `INDECISION_PASSPHRASE`. `serve` exits with an error before binding the port when it is unset; the CLI never needs it. There are no accounts and nothing per-person: everyone who knows the passphrase is the same visitor.
+
+A request without a valid cookie sees the passphrase page. Entering the right passphrase sets a cookie good for 30 days and lands on the Dilemma page; a wrong one shows the passphrase page again. There is no logout; to revoke every cookie at once, change the passphrase and restart. The cookie holds a keyed hash of the passphrase, never the passphrase itself, and is not marked `Secure` because the transport is plain HTTP.
+
+### The run cap
+
+At most two runs may be in flight across the whole server; a third submission gets a "busy, try again" page and neither the Advocate nor the Judge is called. The cap is the `MAX_RUNS_IN_FLIGHT` constant in `src/serve.ts`, not a setting: it bounds what a burst of submissions can spend, and raising it should be a code change someone reads.
+
+## Deploy on a Raspberry Pi
+
+`serve` is meant to run on a Pi that is port-forwarded to the internet. The Pi holds the keys; the passphrase and the cap decide who can spend them and how fast.
+
+**Plain HTTP sends everything in clear.** Until TLS is put in front of the server (a reverse proxy such as Caddy, or a tunnel), the passphrase, the cookie and every Dilemma cross the network unencrypted, and anyone on the path can read or replay them. Treat the passphrase as protection against strangers who stumble on the port, not against anyone watching the traffic.
+
+### Environment
+
+| Variable                | Required by | Meaning                                                          |
+| ----------------------- | ----------- | ---------------------------------------------------------------- |
+| `ZAI_API_KEY`           | CLI, serve  | The Advocate's key (Z.ai GLM).                                   |
+| `TYPESAFE_API_KEY`      | CLI, serve  | The Judge's key (TypeSafe AI jev).                               |
+| `INDECISION_PASSPHRASE` | serve       | The one shared passphrase. `serve` refuses to start without it.  |
+| `PORT`                  | serve       | Port to listen on. Defaults to 3000.                             |
+
+`ZAI_BASE_URL` and `ZAI_MODEL` are optional, as for the CLI. All of them may live in a `.env` file in the working directory instead of the environment.
+
+### Install
+
+```sh
+git clone <this repo> ~/indecision && cd ~/indecision
+pnpm install
+pnpm build
+pnpm link --global      # puts `indecision` on PATH
+```
+
+Run `indecision serve` once by hand with the variables set to confirm it listens, then put it under systemd.
+
+### Run under systemd
+
+Write a unit yourself; none is committed, because the user, paths and port are yours. Keep the secrets in an environment file that only that user can read, and point the unit at it:
+
+```sh
+sudo install -m 600 /dev/null /etc/indecision.env
+sudoedit /etc/indecision.env      # ZAI_API_KEY=..., TYPESAFE_API_KEY=..., INDECISION_PASSPHRASE=..., PORT=3000
+```
+
+A minimal `/etc/systemd/system/indecision.service`, with `pi` and the paths replaced by yours:
+
+```ini
+[Unit]
+Description=indecision serve
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=pi
+WorkingDirectory=/home/pi/indecision
+EnvironmentFile=/etc/indecision.env
+ExecStart=/usr/bin/env indecision serve
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+```
+
+If `indecision` is not on the service user's PATH, use the absolute path to `node` and to `dist/main.js` in `ExecStart` instead. Then:
+
+```sh
+sudo systemctl daemon-reload
+sudo systemctl enable --now indecision
+systemctl status indecision
+journalctl -u indecision -f          # "listening on http://0.0.0.0:3000"
+```
+
+A missing `INDECISION_PASSPHRASE` shows up in the journal as a start-up error and the unit stays down; `Restart=on-failure` will retry, so fix the env file and `systemctl restart indecision`. Forward the port on your router only after the unit is up and the passphrase page answers on the LAN.
 
 ## Develop
 
