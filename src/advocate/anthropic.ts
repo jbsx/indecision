@@ -21,7 +21,7 @@ Rules:
 4. For every Option, write exactly ${POINTS_PER_SIDE} points for it and exactly ${POINTS_PER_SIDE} points against it. Every Option gets the same effort, depth and tone.
 5. Never state a preference, a ranking, a recommendation, a summary that leans one way, or a conclusion. Not in the labels, not in the points, not anywhere. Each point is a single concrete sentence.`;
 
-const CaseSchema = z.object({
+const OptionSchema = z.object({
   label: z.string(),
   for: z.array(z.string()),
   against: z.array(z.string()),
@@ -32,7 +32,7 @@ const ArguedSchema = z.object({
     .string()
     .nullable()
     .describe("One-line reason when the Dilemma names no Options; otherwise null."),
-  options: z.array(CaseSchema),
+  options: z.array(OptionSchema),
 });
 
 /** The Advocate, played by Anthropic's current Sonnet with structured output. */

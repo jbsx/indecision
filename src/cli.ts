@@ -30,7 +30,7 @@ export async function runCli(io: CliIo): Promise<number> {
     return 1;
   }
 
-  io.stdout.write(renderVerdict(outcome.verdict, outcome.options));
+  io.stdout.write(renderVerdict(outcome.verdict));
   io.stdout.write("\n");
   io.stdout.write(renderCases(outcome.options));
   return 0;
@@ -43,12 +43,12 @@ async function resolveDilemma(io: CliIo): Promise<Dilemma> {
   return text.trim();
 }
 
-function renderVerdict(verdict: Verdict, options: readonly Option[]): string {
-  const width = Math.max(...options.map((o) => o.label.length));
+function renderVerdict(verdict: Verdict): string {
+  const assigned = Object.entries(verdict.probabilities);
+  const width = Math.max(...assigned.map(([label]) => label.length));
   const lines = [`Verdict: ${verdict.pick}`];
-  for (const option of options) {
-    const probability = verdict.probabilities[option.label] ?? 0;
-    lines.push(`  ${option.label.padEnd(width)}  ${percent(probability)}`);
+  for (const [label, probability] of assigned) {
+    lines.push(`  ${label.padEnd(width)}  ${percent(probability)}`);
   }
   lines.push(`Confidence: ${verdict.confidence.toFixed(2)}`);
   if (verdict.closeCall) lines.push("Close call: the Cases were nearly balanced.");
@@ -68,6 +68,7 @@ function renderCases(options: readonly Option[]): string {
   return "Cases\n" + blocks.join("\n\n") + "\n";
 }
 
+/** One decimal, so a close call's gap stays visible instead of rounding to the same figure. */
 function percent(probability: number): string {
-  return `${Math.round(probability * 100)}%`;
+  return `${(probability * 100).toFixed(1)}%`;
 }

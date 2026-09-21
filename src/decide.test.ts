@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { decide } from "./decide.js";
 import type { Option } from "./domain.js";
-import type { Advocate, Judge, JudgeAnswer, JudgeRequest, Log, LogEntry } from "./ports.js";
+import type { Advocate, Judge, UnflaggedVerdict, JudgeRequest, Log, LogEntry } from "./ports.js";
 
 const gym: Option = {
   label: "Go to the gym",
@@ -16,7 +16,7 @@ function scriptedAdvocate(options: readonly Option[]): Advocate {
   return { argue: async () => ({ refused: false, options }) };
 }
 
-function recordingJudge(answer: JudgeAnswer): Judge & { requests: JudgeRequest[] } {
+function recordingJudge(answer: UnflaggedVerdict): Judge & { requests: JudgeRequest[] } {
   const requests: JudgeRequest[] = [];
   return {
     requests,
@@ -37,7 +37,7 @@ function recordingLog(): Log & { entries: LogEntry[] } {
   };
 }
 
-const peaked: JudgeAnswer = {
+const peaked: UnflaggedVerdict = {
   pick: "Go to the gym",
   probabilities: { "Go to the gym": 0.8, "Rest at home": 0.2 },
   confidence: 0.9,

@@ -19,6 +19,8 @@ node dist/main.js "Should I go to the gym or rest at home?"
 echo "gym or rest?" | node dist/main.js
 ```
 
+`pnpm link --global` puts the same entry point on your PATH as `indecision`.
+
 The Verdict is printed first, then the Cases. A close call is flagged when the top two probabilities are within 0.1 of each other. Every successful run is appended as one JSON line to `indecision/log.jsonl` under your user data directory (`$XDG_DATA_HOME` on Linux, defaulting to `~/.local/share`).
 
 ## Develop

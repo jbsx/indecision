@@ -55,20 +55,21 @@ describe("indecision CLI", () => {
     const casesAt = stdout.indexOf("Sleep better");
     expect(verdictAt).toBeGreaterThanOrEqual(0);
     expect(casesAt).toBeGreaterThan(verdictAt);
-    expect(stdout).toContain("80%");
-    expect(stdout).toContain("20%");
+    expect(stdout).toContain("80.0%");
+    expect(stdout).toContain("20.0%");
     expect(stdout).toContain("0.90");
   });
 
   it("reads a multi-line Dilemma from stdin when no argument is given", async () => {
     const seen: string[] = [];
-    const { code } = await run([], "gym\nor rest?\n", async (dilemma) => {
+    const { code, stdout } = await run([], "gym\nor rest?\n", async (dilemma) => {
       seen.push(dilemma);
       return outcome;
     });
 
     expect(code).toBe(0);
     expect(seen).toEqual(["gym\nor rest?"]);
+    expect(stdout.indexOf("Verdict: Go to the gym")).toBeLessThan(stdout.indexOf("Cases"));
   });
 
   it("prints a Refusal to stderr and exits 1", async () => {

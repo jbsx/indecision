@@ -58,7 +58,11 @@ function judgeRequest(dilemma: Dilemma, options: readonly Option[]): JudgeReques
   return {
     state: {
       dilemma,
-      options: options.map((o) => ({ label: o.label, for: o.case.for, against: o.case.against })),
+      options: options.map((o) => ({
+        label: o.label,
+        for: [...o.case.for],
+        against: [...o.case.against],
+      })),
     },
     questions: {
       verdict: {
