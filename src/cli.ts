@@ -1,5 +1,6 @@
 import type { Readable, Writable } from "node:stream";
 import type { Dilemma, Option, Outcome, Verdict } from "./domain.js";
+import { errorMessage, percent } from "./format.js";
 
 export interface CliIo {
   readonly argv: readonly string[];
@@ -21,7 +22,7 @@ export async function runCli(io: CliIo): Promise<number> {
   try {
     outcome = await io.decide(dilemma);
   } catch (error) {
-    io.stderr.write(`indecision: ${error instanceof Error ? error.message : String(error)}\n`);
+    io.stderr.write(`indecision: ${errorMessage(error)}\n`);
     return 1;
   }
 
@@ -66,9 +67,4 @@ function renderCases(options: readonly Option[]): string {
     ].join("\n"),
   );
   return "Cases\n" + blocks.join("\n\n") + "\n";
-}
-
-/** One decimal, so a close call's gap stays visible instead of rounding to the same figure. */
-function percent(probability: number): string {
-  return `${(probability * 100).toFixed(1)}%`;
 }

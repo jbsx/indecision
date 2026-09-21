@@ -4,8 +4,9 @@ import { runCli } from "./cli.js";
 import { ConfigError, loadConfig } from "./config.js";
 import { decide } from "./decide.js";
 import { jevJudge } from "./judge/jev.js";
+import { errorMessage } from "./format.js";
 import { jsonlLog } from "./log/jsonl.js";
-import { isServeCommand, readPort, startServer } from "./serve.js";
+import { HOST, isServeCommand, readPort, startServer } from "./serve.js";
 
 let config;
 try {
@@ -30,17 +31,16 @@ if (isServeCommand(argv)) {
     process.stderr.write("indecision: `serve` takes no arguments. Set PORT to pick the port.\n");
     process.exit(1);
   }
-  let port;
   try {
-    port = readPort(process.env);
+    const server = await startServer({ port: readPort(process.env), decide: decideWithPorts });
+    const address = server.address();
+    const port = typeof address === "object" && address !== null ? address.port : "?";
+    process.stderr.write(`indecision: listening on http://${HOST}:${port}\n`);
+    server.on("error", (error) => process.stderr.write(`indecision: ${errorMessage(error)}\n`));
   } catch (error) {
-    process.stderr.write(`indecision: ${error instanceof Error ? error.message : String(error)}\n`);
+    process.stderr.write(`indecision: ${errorMessage(error)}\n`);
     process.exit(1);
   }
-  const server = await startServer({ port, decide: decideWithPorts });
-  const address = server.address();
-  const bound = typeof address === "object" && address !== null ? address.port : port;
-  process.stderr.write(`indecision: listening on http://0.0.0.0:${bound}\n`);
 } else {
   process.exitCode = await runCli({
     argv,

@@ -38,7 +38,6 @@ describe("indecision serve", () => {
     const reply = await get();
 
     expect(reply.status).toBe(200);
-    expect(reply.contentType).toBe("text/html; charset=utf-8");
     expect(reply.html).toContain('<textarea name="dilemma"');
     expect(reply.html).toContain('<form method="post" action="/"');
   });
@@ -129,6 +128,18 @@ describe("indecision serve", () => {
     expect(seen).toEqual([]);
   });
 
+  it("drains an over-cap body to its end so the 413 can still reach the client", async () => {
+    const body = Readable.from(["a".repeat(60), "b".repeat(60), "c".repeat(60)]);
+
+    const reply = await handle(
+      { method: "POST", url: "/", body },
+      { decide: async () => outcome, maxBodyBytes: 100 },
+    );
+
+    expect(reply.status).toBe(413);
+    expect(body.readableEnded).toBe(true);
+  });
+
   it("asks for a Dilemma when the box is empty instead of calling decide", async () => {
     const seen: string[] = [];
     const reply = await post("   ", async (dilemma) => {
@@ -145,7 +156,6 @@ describe("indecision serve", () => {
     const reply = await get("/favicon.ico");
 
     expect(reply.status).toBe(404);
-    expect(reply.contentType).toBe("text/html; charset=utf-8");
   });
 });
 

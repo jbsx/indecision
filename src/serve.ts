@@ -1,6 +1,7 @@
 import { createServer, type Server } from "node:http";
 import type { Readable } from "node:stream";
 import type { Dilemma, Option, Outcome, Verdict } from "./domain.js";
+import { errorMessage, percent } from "./format.js";
 
 /** The parts of an HTTP request the shell looks at. `body` is the raw request stream. */
 export interface Request {
@@ -9,10 +10,9 @@ export interface Request {
   readonly body: Readable;
 }
 
-/** An HTML-only response. The server speaks nothing else. */
+/** An HTML page with a status. The server speaks nothing else. */
 export interface Reply {
   readonly status: number;
-  readonly contentType: "text/html; charset=utf-8";
   readonly html: string;
 }
 
@@ -41,23 +41,31 @@ export function readPort(env: NodeJS.ProcessEnv): number {
   return port;
 }
 
+/** All interfaces, so the page is reachable from another device on the network. */
+export const HOST = "0.0.0.0";
+const CONTENT_TYPE = "text/html; charset=utf-8";
+
 export interface ServeOptions extends ServeDeps {
   readonly port: number;
-  /** All interfaces by default, so the page is reachable from another device on the network. */
-  readonly host?: string;
 }
 
-/** Binds the handler to a plain HTTP server and resolves once it is listening. */
-export function startServer(options: ServeOptions): Promise<Server> {
-  const { port, host = "0.0.0.0", ...deps } = options;
+/** Binds the handler to a plain HTTP server on every interface and resolves once it is listening. */
+export function startServer({ port, ...deps }: ServeOptions): Promise<Server> {
   const server = createServer(async (req, res) => {
-    const reply = await handle({ method: req.method ?? "GET", url: req.url ?? "/", body: req }, deps);
-    res.writeHead(reply.status, { "Content-Type": reply.contentType });
-    res.end(req.method === "HEAD" ? undefined : reply.html);
+    let page: Reply;
+    try {
+      page = await handle({ method: req.method ?? "GET", url: req.url ?? "/", body: req }, deps);
+    } catch (error) {
+      // A client that hangs up mid-request, or a request we can't parse. Never let it take the server down.
+      page = failure(500, `Something went wrong: ${errorMessage(error)}`);
+    }
+    if (res.writableEnded || res.destroyed) return;
+    res.writeHead(page.status, { "Content-Type": CONTENT_TYPE });
+    res.end(req.method === "HEAD" ? undefined : page.html);
   });
   return new Promise((resolve, reject) => {
     server.once("error", reject);
-    server.listen(port, host, () => {
+    server.listen(port, HOST, () => {
       server.off("error", reject);
       resolve(server);
     });
@@ -67,39 +75,45 @@ export function startServer(options: ServeOptions): Promise<Server> {
 /** Thin shell over `decide`: one page with a box for the Dilemma, the Outcome rendered below it. */
 export async function handle(request: Request, deps: ServeDeps): Promise<Reply> {
   if (new URL(request.url, "http://localhost").pathname !== "/") {
-    return page({ dilemma: "", error: "There is nothing at that address; the page is at /." }, 404);
+    return failure(404, "There is nothing at that address; the page is at /.");
   }
-  if (request.method === "GET" || request.method === "HEAD") return page({ dilemma: "" });
-  if (request.method !== "POST") {
-    return page({ dilemma: "", error: "Submit the Dilemma with the form." }, 405);
-  }
+  if (request.method === "GET" || request.method === "HEAD") return reply({ dilemma: "" });
+  if (request.method !== "POST") return failure(405, "Submit the Dilemma with the form.");
 
   const form = await readBody(request.body, deps.maxBodyBytes ?? DEFAULT_MAX_BODY_BYTES);
   if (form === undefined) {
-    return page({ dilemma: "", error: "That Dilemma is too long. Keep it to a few sentences." }, 413);
+    return failure(413, "That Dilemma is too long. Keep it to a few sentences.");
   }
   const dilemma = new URLSearchParams(form).get("dilemma")?.trim() ?? "";
-  if (dilemma === "") return page({ dilemma, error: "No Dilemma given. Type one in the box." }, 400);
+  if (dilemma === "") return failure(400, "No Dilemma given. Type one in the box.");
 
   try {
-    return page({ dilemma, outcome: await deps.decide(dilemma) });
+    return reply({ dilemma, outcome: await deps.decide(dilemma) });
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    return page({ dilemma, error: `Something went wrong: ${message}` }, 500);
+    return failure(500, `Something went wrong: ${errorMessage(error)}`, dilemma);
   }
 }
 
-/** Reads the whole body, or returns undefined as soon as it exceeds the cap. */
+/**
+ * Reads the whole body, or returns undefined when it exceeds the cap. The rest of an over-cap body
+ * is drained rather than cut off, so the 413 page still reaches the client instead of a reset.
+ */
 async function readBody(body: Readable, maxBytes: number): Promise<string | undefined> {
   const chunks: Buffer[] = [];
   let size = 0;
+  let tooLong = false;
   for await (const chunk of body) {
+    if (tooLong) continue;
     const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk));
     size += buffer.byteLength;
-    if (size > maxBytes) return undefined;
-    chunks.push(buffer);
+    if (size > maxBytes) {
+      tooLong = true;
+      chunks.length = 0;
+    } else {
+      chunks.push(buffer);
+    }
   }
-  return Buffer.concat(chunks).toString("utf8");
+  return tooLong ? undefined : Buffer.concat(chunks).toString("utf8");
 }
 
 interface PageState {
@@ -109,13 +123,18 @@ interface PageState {
   readonly error?: string;
 }
 
-function page(state: PageState, status = 200): Reply {
-  return { status, contentType: "text/html; charset=utf-8", html: renderPage(state) };
+function reply(state: PageState, status = 200): Reply {
+  return { status, html: renderPage(state) };
+}
+
+/** The same page with a banner instead of an Outcome; the Dilemma stays in the box when there is one. */
+function failure(status: number, message: string, dilemma: Dilemma = ""): Reply {
+  return reply({ dilemma, error: message }, status);
 }
 
 function renderPage(state: PageState): string {
   const banner = state.error === undefined ? "" : renderError(state.error);
-  const result = state.outcome === undefined ? "" : renderOutcome(state.outcome);
+  const renderedOutcome = state.outcome === undefined ? "" : renderOutcome(state.outcome);
   return `<!doctype html>
 <html lang="en">
 <head>
@@ -133,7 +152,7 @@ ${banner}<form method="post" action="/">
 <button type="submit">Decide</button>
 <p class="waiting" hidden aria-live="polite">Deciding…</p>
 </form>
-${result}</main>
+${renderedOutcome}</main>
 <script>
 document.querySelector("form").addEventListener("submit", function (event) {
   event.target.querySelector("button").disabled = true;
@@ -220,12 +239,7 @@ function points(items: readonly string[]): string {
   return items.map((point) => `<li>${escape(point)}</li>`).join("\n");
 }
 
-/** One decimal, so a close call's gap stays visible instead of rounding to the same figure. */
-function percent(probability: number): string {
-  return `${(probability * 100).toFixed(1)}%`;
-}
-
-/** Everything the page shows comes from a person or a model; none of it is markup. */
+/** Everything the page shows was written by the person, the Advocate or the Judge; none of it is markup. */
 function escape(text: string): string {
   return text
     .replaceAll("&", "&amp;")
