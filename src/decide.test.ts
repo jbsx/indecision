@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { decide } from "./decide.js";
 import type { Option } from "./domain.js";
 import type { Advocate, Judge, UnflaggedVerdict, JudgeRequest, Log, LogEntry } from "./ports.js";
+import type { Stage } from "./decide.js";
 
 const gym: Option = {
   label: "Go to the gym",
@@ -175,5 +176,48 @@ describe("decide", () => {
         timestamp: "2026-09-21T20:00:00.000Z",
       },
     ]);
+  });
+
+  it("announces the Advocate stage before arguing and the Judge stage before judging", async () => {
+    const order: string[] = [];
+    const advocate: Advocate = {
+      argue: async () => {
+        order.push("argue");
+        return { refused: false, options: [gym, rest] };
+      },
+    };
+    const judge: Judge = {
+      judge: async () => {
+        order.push("judge");
+        return peaked;
+      },
+    };
+    const onStage = (stage: Stage) => {
+      order.push(`stage:${stage}`);
+    };
+
+    const withHook = await decide("gym or rest?", { advocate, judge, log: recordingLog(), onStage });
+    const withoutHook = await decide("gym or rest?", { advocate, judge, log: recordingLog() });
+
+    expect(order).toEqual(["stage:advocate", "argue", "stage:judge", "judge", "argue", "judge"]);
+    expect(withoutHook).toEqual(withHook);
+  });
+
+  it("announces only the Advocate stage when the Advocate refuses", async () => {
+    const stages: Stage[] = [];
+    const advocate: Advocate = {
+      argue: async () => ({ refused: true, reason: "No Options are named." }),
+    };
+
+    await decide("I feel stuck", {
+      advocate,
+      judge: recordingJudge(peaked),
+      log: recordingLog(),
+      onStage: (stage) => {
+        stages.push(stage);
+      },
+    });
+
+    expect(stages).toEqual(["advocate"]);
   });
 });

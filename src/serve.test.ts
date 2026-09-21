@@ -1,5 +1,6 @@
 import { Readable } from "node:stream";
 import { describe, expect, it } from "vitest";
+import type { Stage } from "./decide.js";
 import type { Outcome } from "./domain.js";
 import {
   createHandler,
@@ -8,7 +9,11 @@ import {
   readPassphrase,
   readPort,
   type Handler,
+  type Page,
   type Reply,
+  type RunEvent,
+  type ServeDeps,
+  type Stream,
 } from "./serve.js";
 
 const PASSPHRASE = "open sesame";
@@ -27,8 +32,10 @@ const outcome: Outcome = {
   },
 };
 
+type Decide = ServeDeps["decide"];
+
 function handler(
-  decide = async (_: string) => outcome,
+  decide: Decide = async () => outcome,
   maxBodyBytes?: number,
   now?: () => Date,
 ): Handler {
@@ -40,26 +47,31 @@ function handler(
   });
 }
 
+function page(reply: Reply): Page {
+  if (!("html" in reply)) throw new Error("expected a whole page, got a stream");
+  return reply;
+}
+
 function postForm(handle: Handler, url: string, fields: Record<string, string>, cookie?: string) {
   const form = new URLSearchParams(fields).toString();
   return handle({ method: "POST", url, cookie, body: Readable.from([form]) });
 }
 
-function unlock(handle: Handler, passphrase: string): Promise<Reply> {
-  return postForm(handle, "/unlock", { passphrase });
+async function unlock(handle: Handler, passphrase: string): Promise<Page> {
+  return page(await postForm(handle, "/unlock", { passphrase }));
 }
 
-function postDilemma(handle: Handler, dilemma: string, cookie?: string): Promise<Reply> {
-  return postForm(handle, "/", { dilemma }, cookie);
+async function postDilemma(handle: Handler, dilemma: string, cookie?: string): Promise<Page> {
+  return page(await postForm(handle, "/", { dilemma }, cookie));
 }
 
 /** The Dilemma page, as a browser holding `cookie` would ask for it. */
-function open(handle: Handler, cookie?: string): Promise<Reply> {
-  return handle({ method: "GET", url: "/", cookie, body: Readable.from([]) });
+async function open(handle: Handler, cookie?: string): Promise<Page> {
+  return page(await handle({ method: "GET", url: "/", cookie, body: Readable.from([]) }));
 }
 
 /** The `name=value` part of a Set-Cookie, as a browser would send it back. */
-function cookieValue(reply: Reply): string {
+function cookieValue(reply: Page): string {
   return reply.headers?.["Set-Cookie"]?.split(";")[0] ?? "";
 }
 
@@ -68,18 +80,78 @@ async function cookieFor(handle: Handler): Promise<string> {
   return cookieValue(await unlock(handle, PASSPHRASE));
 }
 
-async function get(url = "/", handle = handler()): Promise<Reply> {
+async function get(url = "/", handle = handler()): Promise<Page> {
   const cookie = await cookieFor(handle);
-  return handle({ method: "GET", url, cookie, body: Readable.from([]) });
+  return page(await handle({ method: "GET", url, cookie, body: Readable.from([]) }));
 }
 
 async function post(
   body: string,
-  decide = async (_: string) => outcome,
+  decide: Decide = async () => outcome,
   maxBodyBytes?: number,
-): Promise<Reply> {
+): Promise<Page> {
   const handle = handler(decide, maxBodyBytes);
   return postDilemma(handle, body, await cookieFor(handle));
+}
+
+/** The page's script's submission: POSTs to the streamed route and hands back the Stream, not yet run. */
+async function openStream(handle: Handler, dilemma: string, cookie?: string): Promise<Stream> {
+  const reply = await postForm(handle, "/decide", { dilemma }, cookie);
+  if ("html" in reply) throw new Error("expected a stream, got a whole page");
+  return reply;
+}
+
+/** Runs a Stream and collects what it sends, in order. */
+async function collect(reply: Stream): Promise<RunEvent[]> {
+  const events: RunEvent[] = [];
+  await reply.run((event) => {
+    events.push(event);
+  });
+  return events;
+}
+
+/** An unlocked browser's streamed submission, run to the end. */
+async function stream(
+  body: string,
+  decide: Decide = async () => outcome,
+  maxBodyBytes?: number,
+): Promise<{ status: number; events: RunEvent[] }> {
+  const handle = handler(decide, maxBodyBytes);
+  const reply = await openStream(handle, body, await cookieFor(handle));
+  return { status: reply.status, events: await collect(reply) };
+}
+
+/** A `decide` that fires both stages, as the real pipeline does, before settling. */
+function staged(settle: () => Promise<Outcome>): Decide {
+  return async (_, onStage) => {
+    onStage?.("advocate");
+    onStage?.("judge");
+    return settle();
+  };
+}
+
+/** A `decide` that stays in flight until the test releases it, and tells the test when it was called. */
+function stalledDecide() {
+  const pending: Array<(outcome: Outcome) => void> = [];
+  const seen: string[] = [];
+  let started = () => {};
+  const decide = (dilemma: string) =>
+    new Promise<Outcome>((resolve) => {
+      seen.push(dilemma);
+      pending.push(resolve);
+      started();
+    });
+  const untilInFlight = (count: number) =>
+    new Promise<void>((resolve) => {
+      started = () => {
+        if (pending.length >= count) resolve();
+      };
+      started();
+    });
+  const releaseAll = () => {
+    for (const resolve of pending.splice(0)) resolve(outcome);
+  };
+  return { decide, seen, untilInFlight, releaseAll };
 }
 
 describe("the passphrase gate", () => {
@@ -116,9 +188,9 @@ describe("the passphrase gate", () => {
     expect(setCookie).toMatch(/Path=\//);
     expect(setCookie).not.toMatch(/Secure/);
 
-    const page = await open(handle, cookieValue(unlocked));
-    expect(page.status).toBe(200);
-    expect(page.html).toContain('<textarea name="dilemma"');
+    const landed = await open(handle, cookieValue(unlocked));
+    expect(landed.status).toBe(200);
+    expect(landed.html).toContain('<textarea name="dilemma"');
   });
 
   it("accepts the passphrase with stray whitespace around it", async () => {
@@ -172,6 +244,20 @@ describe("the passphrase gate", () => {
     expect(seen).toEqual([]);
   });
 
+  it("answers the page's script with the passphrase page, not a stream, once the unlock is gone", async () => {
+    const seen: string[] = [];
+    const handle = handler(async (dilemma) => {
+      seen.push(dilemma);
+      return outcome;
+    });
+
+    const reply = await postForm(handle, "/decide", { dilemma: "gym or rest?" });
+
+    expect(page(reply).status).toBe(401);
+    expect(page(reply).html).toContain('name="passphrase"');
+    expect(seen).toEqual([]);
+  });
+
   it("finds its cookie among others and rejects a forged one, even a non-ASCII one", async () => {
     const handle = handler();
     const cookie = await cookieFor(handle);
@@ -185,30 +271,6 @@ describe("the passphrase gate", () => {
 });
 
 describe("the run cap", () => {
-  /** A `decide` that stays in flight until the test releases it, and tells the test when it was called. */
-  function stalledDecide() {
-    const pending: Array<(outcome: Outcome) => void> = [];
-    const seen: string[] = [];
-    let started = () => {};
-    const decide = (dilemma: string) =>
-      new Promise<Outcome>((resolve) => {
-        seen.push(dilemma);
-        pending.push(resolve);
-        started();
-      });
-    const untilInFlight = (count: number) =>
-      new Promise<void>((resolve) => {
-        started = () => {
-          if (pending.length >= count) resolve();
-        };
-        started();
-      });
-    const releaseAll = () => {
-      for (const resolve of pending.splice(0)) resolve(outcome);
-    };
-    return { decide, seen, untilInFlight, releaseAll };
-  }
-
   it("answers a third submission with a busy page while two runs are in flight, without deciding", async () => {
     const { decide, seen, untilInFlight, releaseAll } = stalledDecide();
     const handle = handler(decide);
@@ -229,6 +291,33 @@ describe("the run cap", () => {
     releaseAll();
     expect((await first).status).toBe(200);
     expect((await second).status).toBe(200);
+  });
+
+  it("counts streamed runs too, and turns a third away with a busy banner, without deciding", async () => {
+    const { decide, seen, untilInFlight, releaseAll } = stalledDecide();
+    const handle = handler(decide);
+    const cookie = await cookieFor(handle);
+
+    const first = collect(await openStream(handle, "gym or rest?", cookie));
+    const second = collect(await openStream(handle, "tea or coffee?", cookie));
+    await untilInFlight(2);
+    const third = await openStream(handle, "walk or bus?", cookie);
+    const thirdEvents = await collect(third);
+    const viaForm = await postDilemma(handle, "walk or bus?", cookie);
+
+    expect(third.status).toBe(503);
+    expect(third.headers?.["Retry-After"]).toMatch(/^\d+$/);
+    expect(thirdEvents).toHaveLength(1);
+    expect(thirdEvents[0]).toMatchObject({ error: expect.stringContaining("busy") });
+    expect(viaForm.status).toBe(503);
+    expect(seen).toEqual(["gym or rest?", "tea or coffee?"]);
+
+    releaseAll();
+    await Promise.all([first, second]);
+    const fourth = postDilemma(handle, "walk or bus?", cookie);
+    await untilInFlight(1);
+    releaseAll();
+    expect((await fourth).status).toBe(200);
   });
 
   it("frees a slot when a run finishes", async () => {
@@ -265,6 +354,26 @@ describe("the run cap", () => {
     const next = await postDilemma(handle, "gym or rest?", cookie);
 
     expect(next.status).toBe(200);
+    expect(calls).toBe(MAX_RUNS_IN_FLIGHT + 1);
+  });
+
+  it("frees a slot when a streamed run throws", async () => {
+    let calls = 0;
+    const handle = handler(async () => {
+      calls += 1;
+      if (calls <= MAX_RUNS_IN_FLIGHT) throw new Error("jev unreachable");
+      return outcome;
+    });
+    const cookie = await cookieFor(handle);
+
+    for (let i = 0; i < MAX_RUNS_IN_FLIGHT; i += 1) {
+      const events = await collect(await openStream(handle, "gym or rest?", cookie));
+      expect(events[0]).toMatchObject({ error: expect.stringContaining("jev unreachable") });
+    }
+    const next = await openStream(handle, "gym or rest?", cookie);
+
+    expect(next.status).toBe(200);
+    expect(await collect(next)).toEqual([{ outcome: expect.stringContaining("Verdict") }]);
     expect(calls).toBe(MAX_RUNS_IN_FLIGHT + 1);
   });
 });
@@ -369,7 +478,7 @@ describe("indecision serve", () => {
     const cookie = await cookieFor(handle);
     const body = Readable.from(["a".repeat(60), "b".repeat(60), "c".repeat(60)]);
 
-    const reply = await handle({ method: "POST", url: "/", cookie, body });
+    const reply = page(await handle({ method: "POST", url: "/", cookie, body }));
 
     expect(reply.status).toBe(413);
     expect(body.readableEnded).toBe(true);
@@ -391,6 +500,134 @@ describe("indecision serve", () => {
     const reply = await get("/favicon.ico");
 
     expect(reply.status).toBe(404);
+  });
+
+  it("gives the page a script that submits to the streamed route and slots for the banner and outcome", async () => {
+    const reply = await get();
+
+    expect(reply.html).toContain('fetch("/decide"');
+    expect(reply.html).toContain('id="banner"');
+    expect(reply.html).toContain('id="outcome"');
+  });
+});
+
+describe("the streamed route", () => {
+  it("sends the Advocate stage, then the Judge stage, then the Verdict above the Cases", async () => {
+    const seen: string[] = [];
+    const { status, events } = await stream("gym or rest?", async (dilemma, onStage) => {
+      seen.push(dilemma);
+      onStage?.("advocate");
+      seen.push("argue");
+      onStage?.("judge");
+      seen.push("judge");
+      return outcome;
+    });
+
+    expect(status).toBe(200);
+    expect(seen).toEqual(["gym or rest?", "argue", "judge"]);
+    expect(events).toHaveLength(3);
+    expect(events[0]).toEqual({ stage: "advocate", text: "The Advocate is arguing…" });
+    expect(events[1]).toEqual({ stage: "judge", text: "The Judge is weighing…" });
+    const last = events[2];
+    if (last === undefined || !("outcome" in last)) throw new Error("expected an outcome last");
+    const verdictAt = last.outcome.indexOf("Verdict");
+    const casesAt = last.outcome.indexOf("Cases");
+    expect(verdictAt).toBeGreaterThanOrEqual(0);
+    expect(casesAt).toBeGreaterThan(verdictAt);
+    expect(last.outcome).toContain("80.0%");
+    expect(last.outcome).toContain("<details open>");
+  });
+
+  it("sends each stage as it happens, not only once the outcome is in", async () => {
+    let release = () => {};
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const handle = handler(async (_, onStage) => {
+      onStage?.("advocate");
+      await gate;
+      onStage?.("judge");
+      return outcome;
+    });
+    const reply = await openStream(handle, "gym or rest?", await cookieFor(handle));
+
+    const stages: Stage[] = [];
+    const finished = reply.run((event) => {
+      if ("stage" in event) stages.push(event.stage);
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(stages).toEqual(["advocate"]);
+
+    release();
+    await finished;
+    expect(stages).toEqual(["advocate", "judge"]);
+  });
+
+  it("sends a Refusal as an outcome after the stages", async () => {
+    const { status, events } = await stream(
+      "I feel stuck",
+      staged(async () => ({ refused: true, reason: "No Options are named." })),
+    );
+
+    expect(status).toBe(200);
+    expect(events.map((event) => Object.keys(event)[0])).toEqual(["stage", "stage", "outcome"]);
+    const last = events[2];
+    if (last === undefined || !("outcome" in last)) throw new Error("expected an outcome last");
+    expect(last.outcome).toContain("No Options are named.");
+    expect(last.outcome).not.toContain("Verdict");
+    expect(last.outcome).not.toContain('class="error"');
+  });
+
+  it("sends a thrown error as a banner after the stages", async () => {
+    const { status, events } = await stream(
+      "gym or rest?",
+      staged(async () => {
+        throw new Error("jev unreachable");
+      }),
+    );
+
+    expect(status).toBe(200);
+    expect(events.map((event) => Object.keys(event)[0])).toEqual(["stage", "stage", "error"]);
+    const last = events[2];
+    if (last === undefined || !("error" in last)) throw new Error("expected an error last");
+    expect(last.error).toContain('class="error"');
+    expect(last.error).toContain("jev unreachable");
+  });
+
+  it("rejects a body over the cap with an error and never calls decide", async () => {
+    const seen: string[] = [];
+    const { status, events } = await stream(
+      "x".repeat(200),
+      async (dilemma) => {
+        seen.push(dilemma);
+        return outcome;
+      },
+      100,
+    );
+
+    expect(status).toBe(413);
+    expect(seen).toEqual([]);
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({ error: expect.stringContaining("too long") });
+  });
+
+  it("asks for a Dilemma when the box is empty instead of calling decide", async () => {
+    const seen: string[] = [];
+    const { status, events } = await stream("   ", async (dilemma) => {
+      seen.push(dilemma);
+      return outcome;
+    });
+
+    expect(status).toBe(400);
+    expect(seen).toEqual([]);
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({ error: expect.stringContaining("No Dilemma given") });
+  });
+
+  it("answers a GET on the streamed route with 405", async () => {
+    const reply = await get("/decide");
+
+    expect(reply.status).toBe(405);
   });
 });
 

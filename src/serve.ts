@@ -1,5 +1,6 @@
 import { createServer, type Server } from "node:http";
 import type { Readable } from "node:stream";
+import type { Stage } from "./decide.js";
 import type { Dilemma, Option, Outcome, Verdict } from "./domain.js";
 import { errorMessage, percent } from "./format.js";
 import { deriveUnlockKey, isPassphrase, isUnlocked, unlockCookie } from "./gate.js";
@@ -12,17 +13,38 @@ export interface Request {
   readonly body: Readable;
 }
 
-/** An HTML page with a status, plus any headers beyond the content type. The server speaks nothing else. */
-export interface Reply {
+/** A whole HTML page with a status, plus any headers beyond the content type. */
+export interface Page {
   readonly status: number;
   readonly html: string;
   readonly headers?: Readonly<Record<string, string>>;
 }
 
+/**
+ * One step of a run as the page's script sees it: which role is at work, or the finished
+ * outcome (Verdict above Cases, or a Refusal) or the error banner, both as HTML fragments rendered
+ * exactly as the whole page would render them.
+ */
+export type RunEvent =
+  | { readonly stage: Stage; readonly text: string }
+  | { readonly outcome: string }
+  | { readonly error: string };
+
+/** A run's progress, handed to `send` one event at a time as it happens. Resolves once the run is over. */
+export interface Stream {
+  readonly status: number;
+  readonly headers?: Readonly<Record<string, string>>;
+  readonly run: (send: (event: RunEvent) => void) => Promise<void>;
+}
+
+/** What a request gets back. The form's own POST gets a Page; the page's script gets a Stream. */
+export type Reply = Page | Stream;
+
 export type Handler = (request: Request) => Promise<Reply>;
 
 export interface ServeDeps {
-  readonly decide: (dilemma: Dilemma) => Promise<Outcome>;
+  /** The pipeline, told where the time is going through `onStage` just before each role is asked. */
+  readonly decide: (dilemma: Dilemma, onStage?: (stage: Stage) => void) => Promise<Outcome>;
   /** The one shared passphrase. Whoever knows it may spend the API keys; nobody else may. */
   readonly passphrase: string;
   /** Cap on the request body. A Dilemma is a few sentences; anything larger is a mistake. */
@@ -44,6 +66,8 @@ export const MAX_RUNS_IN_FLIGHT = 2;
 const BUSY_RETRY_AFTER_SECONDS = 30;
 
 const UNLOCK_PATH = "/unlock";
+/** Where the page's script sends the Dilemma. The form itself still posts to /. */
+const STREAM_PATH = "/decide";
 
 /** `indecision serve` starts the server. Only the whole first word is reserved: "serve or rest?" is a Dilemma. */
 export function isServeCommand(argv: readonly string[]): boolean {
@@ -77,7 +101,33 @@ export function readPassphrase(env: NodeJS.ProcessEnv): string {
 
 /** All interfaces, so the page is reachable from another device on the network. */
 export const HOST = "0.0.0.0";
-const CONTENT_TYPE = "text/html; charset=utf-8";
+const HTML_TYPE = "text/html; charset=utf-8";
+/** One JSON object per line, written as each event happens. */
+const NDJSON_TYPE = "application/x-ndjson; charset=utf-8";
+
+const STAGE_TEXT: Readonly<Record<Stage, string>> = {
+  advocate: "The Advocate is arguing…",
+  judge: "The Judge is weighing…",
+};
+
+const NOT_A_FORM_POST = "Submit the Dilemma with the form.";
+
+/** Why a submission is turned away before anything is decided, with the status that says so. */
+interface Rejection {
+  readonly status: number;
+  readonly reason: string;
+}
+
+const BUSY: Rejection = {
+  status: 503,
+  reason: "The server is busy deciding for someone else; try again in a moment.",
+};
+const RETRY_AFTER = { "Retry-After": String(BUSY_RETRY_AFTER_SECONDS) };
+
+/** A thrown failure (adapter, network), worded for the person. Nothing was decided. */
+function somethingWentWrong(error: unknown): string {
+  return `Something went wrong: ${errorMessage(error)}`;
+}
 
 export interface ServeOptions extends ServeDeps {
   readonly port: number;
@@ -87,9 +137,9 @@ export interface ServeOptions extends ServeDeps {
 export function startServer({ port, ...deps }: ServeOptions): Promise<Server> {
   const handle = createHandler(deps);
   const server = createServer(async (req, res) => {
-    let page: Reply;
+    let reply: Reply;
     try {
-      page = await handle({
+      reply = await handle({
         method: req.method ?? "GET",
         url: req.url ?? "/",
         cookie: req.headers.cookie,
@@ -97,11 +147,27 @@ export function startServer({ port, ...deps }: ServeOptions): Promise<Server> {
       });
     } catch (error) {
       // A client that hangs up mid-request, or a request we can't parse. Never let it take the server down.
-      page = failure(500, `Something went wrong: ${errorMessage(error)}`);
+      reply = failure(500, somethingWentWrong(error));
     }
-    if (res.writableEnded || res.destroyed) return;
-    res.writeHead(page.status, { "Content-Type": CONTENT_TYPE, ...page.headers });
-    res.end(req.method === "HEAD" ? undefined : page.html);
+    if ("html" in reply) {
+      if (res.writableEnded || res.destroyed) return;
+      res.writeHead(reply.status, { "Content-Type": HTML_TYPE, ...reply.headers });
+      res.end(req.method === "HEAD" ? undefined : reply.html);
+      return;
+    }
+    if (!res.destroyed) {
+      res.writeHead(reply.status, {
+        "Content-Type": NDJSON_TYPE,
+        "Cache-Control": "no-store",
+        ...reply.headers,
+      });
+      res.flushHeaders();
+    }
+    // Always run, even for a client that has gone: the run may hold a slot under the cap to give back.
+    await reply.run((event) => {
+      if (!res.destroyed) res.write(JSON.stringify(event) + "\n");
+    });
+    if (!res.destroyed) res.end();
   });
   return new Promise((resolve, reject) => {
     server.once("error", reject);
@@ -114,13 +180,26 @@ export function startServer({ port, ...deps }: ServeOptions): Promise<Server> {
 
 /**
  * Thin shell over `decide`: one page with a box for the Dilemma, the Outcome rendered below it,
- * behind a passphrase page that everyone shares. One handler serves every request.
+ * behind a passphrase page that everyone shares. One handler serves every request. The page's
+ * script posts to the streamed route instead of the form's own, and gets the stages as they happen.
  */
 export function createHandler(deps: ServeDeps): Handler {
   const maxBodyBytes = deps.maxBodyBytes ?? DEFAULT_MAX_BODY_BYTES;
   const now = deps.now ?? (() => new Date());
   const key = deriveUnlockKey(deps.passphrase);
   let runsInFlight = 0;
+
+  /** Takes a slot under the cap, or none when the server is busy. What comes back gives the slot up. */
+  const takeSlot = (): (() => void) | undefined => {
+    if (runsInFlight >= MAX_RUNS_IN_FLIGHT) return undefined;
+    runsInFlight += 1;
+    let given = false;
+    return () => {
+      if (given) return;
+      given = true;
+      runsInFlight -= 1;
+    };
+  };
 
   return async (request) => {
     const path = new URL(request.url, "http://localhost").pathname;
@@ -133,34 +212,69 @@ export function createHandler(deps: ServeDeps): Handler {
       const headers = { Location: "/", "Set-Cookie": unlockCookie(await key, now()) };
       return { status: 303, html: "", headers };
     }
-    if (path !== "/") return failure(404, "There is nothing at that address; the page is at /.");
-
-    if (!isUnlocked(request.cookie, await key, now())) return passphrasePage();
-    if (request.method === "GET" || request.method === "HEAD") return reply({ dilemma: "" });
-    if (request.method !== "POST") return failure(405, "Submit the Dilemma with the form.");
-
-    const form = await readBody(request.body, maxBodyBytes);
-    if (form === undefined) {
-      return failure(413, "That Dilemma is too long. Keep it to a few sentences.");
+    if (path !== "/" && path !== STREAM_PATH) {
+      return failure(404, "There is nothing at that address; the page is at /.");
     }
-    const dilemma = new URLSearchParams(form).get("dilemma")?.trim() ?? "";
-    if (dilemma === "") return failure(400, "No Dilemma given. Type one in the box.");
 
-    if (runsInFlight >= MAX_RUNS_IN_FLIGHT) {
+    // The script falls back to the form's own POST when it gets a page instead of a Stream here.
+    if (!isUnlocked(request.cookie, await key, now())) return passphrasePage();
+
+    if (path === STREAM_PATH) {
+      if (request.method !== "POST") return failure(405, NOT_A_FORM_POST);
+      const submitted = await readDilemma(request.body, maxBodyBytes);
+      if ("reason" in submitted) return turnedAway(submitted);
+      const giveBack = takeSlot();
+      if (giveBack === undefined) return { ...turnedAway(BUSY), headers: RETRY_AFTER };
       return {
-        ...failure(503, "The server is busy deciding for someone else; try again in a moment.", dilemma),
-        headers: { "Retry-After": String(BUSY_RETRY_AFTER_SECONDS) },
+        status: 200,
+        run: async (send) => {
+          try {
+            const outcome = await deps.decide(submitted.dilemma, (stage) =>
+              send({ stage, text: STAGE_TEXT[stage] }),
+            );
+            send({ outcome: renderOutcome(outcome) });
+          } catch (error) {
+            send({ error: renderError(somethingWentWrong(error)) });
+          } finally {
+            giveBack();
+          }
+        },
       };
     }
-    runsInFlight += 1;
+
+    if (request.method === "GET" || request.method === "HEAD") return page({ dilemma: "" });
+    if (request.method !== "POST") return failure(405, NOT_A_FORM_POST);
+
+    const submitted = await readDilemma(request.body, maxBodyBytes);
+    if ("reason" in submitted) return failure(submitted.status, submitted.reason);
+    const { dilemma } = submitted;
+
+    const giveBack = takeSlot();
+    if (giveBack === undefined) {
+      return { ...failure(BUSY.status, BUSY.reason, dilemma), headers: RETRY_AFTER };
+    }
     try {
-      return reply({ dilemma, outcome: await deps.decide(dilemma) });
+      return page({ dilemma, outcome: await deps.decide(dilemma) });
     } catch (error) {
-      return failure(500, `Something went wrong: ${errorMessage(error)}`, dilemma);
+      return failure(500, somethingWentWrong(error), dilemma);
     } finally {
-      runsInFlight -= 1;
+      giveBack();
     }
   };
+}
+
+/** The Dilemma from the form body, or the Rejection. */
+async function readDilemma(
+  body: Readable,
+  maxBodyBytes: number,
+): Promise<{ dilemma: Dilemma } | Rejection> {
+  const form = await readBody(body, maxBodyBytes);
+  if (form === undefined) {
+    return { status: 413, reason: "That Dilemma is too long. Keep it to a few sentences." };
+  }
+  const dilemma = new URLSearchParams(form).get("dilemma")?.trim() ?? "";
+  if (dilemma === "") return { status: 400, reason: "No Dilemma given. Type one in the box." };
+  return { dilemma };
 }
 
 /**
@@ -192,17 +306,23 @@ interface PageState {
   readonly error?: string;
 }
 
-function reply(state: PageState, status = 200): Reply {
+function page(state: PageState, status = 200): Page {
   return { status, html: renderPage(state) };
 }
 
 /** The same page with a banner instead of an Outcome; the Dilemma stays in the box when there is one. */
-function failure(status: number, message: string, dilemma: Dilemma = ""): Reply {
-  return reply({ dilemma, error: message }, status);
+function failure(status: number, message: string, dilemma: Dilemma = ""): Page {
+  return page({ dilemma, error: message }, status);
+}
+
+/** A Stream that carries only why the submission was turned away, for the page's script to show as the banner. */
+function turnedAway(rejection: Rejection): Stream {
+  const banner = renderError(rejection.reason);
+  return { status: rejection.status, run: async (send) => send({ error: banner }) };
 }
 
 /** The page anyone without a valid cookie sees. 401: the request is understood, the visitor is not. */
-function passphrasePage(error?: string): Reply {
+function passphrasePage(error?: string): Page {
   const banner = error === undefined ? "" : renderError(error);
   return {
     status: 401,
@@ -218,13 +338,15 @@ function passphrasePage(error?: string): Reply {
 function renderPage(state: PageState): string {
   const banner = state.error === undefined ? "" : renderError(state.error);
   const renderedOutcome = state.outcome === undefined ? "" : renderOutcome(state.outcome);
-  return frame(`${banner}<form method="post" action="/">
+  return frame(`<div id="banner">${banner}</div>
+<form method="post" action="/">
 <label for="dilemma">What are you stuck on?</label>
 <textarea name="dilemma" id="dilemma" rows="5" required>${escape(state.dilemma)}</textarea>
 <button type="submit">Decide</button>
 <p class="waiting" hidden aria-live="polite">Deciding…</p>
 </form>
-${renderedOutcome}`);
+<div id="outcome">${renderedOutcome}</div>
+`);
 }
 
 /** The document around either page's main content. */
@@ -241,13 +363,7 @@ function frame(main: string): string {
 <main>
 <h1>indecision</h1>
 ${main}</main>
-<script>
-document.querySelector("form").addEventListener("submit", function (event) {
-  event.target.querySelector("button").disabled = true;
-  var waiting = event.target.querySelector(".waiting");
-  if (waiting) waiting.hidden = false;
-});
-</script>
+<script>${SCRIPT}</script>
 </body>
 </html>
 `;
@@ -268,6 +384,70 @@ details { border: 1px solid #ddd; padding: .5rem 1rem; margin-bottom: .75rem; ba
 summary { font-weight: 600; cursor: pointer; }
 h4 { margin: .5rem 0 0; }
 ul { margin: .25rem 0; }
+`;
+
+/**
+ * On the Dilemma page, submits to the streamed route and shows each stage as it arrives, then the
+ * outcome or the banner, without reloading. On the passphrase page, or without fetch, or when the
+ * server answers with a page instead of a Stream (the unlock has expired), the form posts itself.
+ */
+const SCRIPT = `
+(function () {
+  var form = document.querySelector("form");
+  var button = form.querySelector("button");
+  var waiting = form.querySelector(".waiting");
+  var banner = document.getElementById("banner");
+  var outcome = document.getElementById("outcome");
+  var streams = Boolean(waiting && window.fetch && window.ReadableStream && window.TextDecoder);
+
+  form.addEventListener("submit", function (event) {
+    button.disabled = true;
+    if (!streams) {
+      if (waiting) waiting.hidden = false;
+      return;
+    }
+    event.preventDefault();
+    banner.innerHTML = "";
+    outcome.innerHTML = "";
+    waiting.textContent = "Deciding…";
+    waiting.hidden = false;
+    fetch("${STREAM_PATH}", { method: "POST", body: new URLSearchParams(new FormData(form)) })
+      .then(function (response) {
+        var type = response.headers.get("Content-Type") || "";
+        if (type.indexOf("${NDJSON_TYPE.split(";")[0]}") !== 0) return form.submit();
+        return readLines(response.body, apply);
+      })
+      .catch(function (error) { banner.innerHTML = ""; banner.appendChild(errorBanner(error)); })
+      .then(function () { waiting.hidden = true; button.disabled = false; });
+  });
+
+  function apply(event) {
+    if ("stage" in event) waiting.textContent = event.text;
+    else if ("outcome" in event) outcome.innerHTML = event.outcome;
+    else if ("error" in event) banner.innerHTML = event.error;
+  }
+
+  function readLines(body, onLine) {
+    var reader = body.getReader();
+    var decoder = new TextDecoder();
+    var buffered = "";
+    return reader.read().then(function step(chunk) {
+      buffered += decoder.decode(chunk.value || new Uint8Array(), { stream: !chunk.done });
+      var lines = buffered.split("\\n");
+      buffered = lines.pop();
+      lines.forEach(function (line) { if (line) onLine(JSON.parse(line)); });
+      return chunk.done ? undefined : reader.read().then(step);
+    });
+  }
+
+  function errorBanner(error) {
+    var p = document.createElement("p");
+    p.className = "error";
+    p.setAttribute("role", "alert");
+    p.textContent = "Something went wrong: " + ((error && error.message) || error);
+    return p;
+  }
+})();
 `;
 
 function renderError(message: string): string {

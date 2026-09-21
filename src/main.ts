@@ -2,7 +2,7 @@
 import { zaiAdvocate } from "./advocate/zai.js";
 import { runCli } from "./cli.js";
 import { ConfigError, loadConfig } from "./config.js";
-import { decide } from "./decide.js";
+import { decide, type Stage } from "./decide.js";
 import { jevJudge } from "./judge/jev.js";
 import { errorMessage } from "./format.js";
 import { jsonlLog } from "./log/jsonl.js";
@@ -24,7 +24,9 @@ const ports = {
 };
 
 const argv = process.argv.slice(2);
-const decideWithPorts = (dilemma: string) => decide(dilemma, ports);
+/** The pipeline over the real adapters. Only the web shell asks to hear the stages. */
+const decideWithPorts = (dilemma: string, onStage?: (stage: Stage) => void) =>
+  decide(dilemma, onStage === undefined ? ports : { ...ports, onStage });
 
 if (isServeCommand(argv)) {
   if (argv.length > 1) {

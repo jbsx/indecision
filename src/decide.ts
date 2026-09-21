@@ -1,12 +1,17 @@
 import type { Dilemma, Option, Outcome, Verdict } from "./domain.js";
 import type { Advocate, Judge, JudgeRequest, Log } from "./ports.js";
 
+/** The two waits in a run: the Advocate arguing the Cases, then the Judge weighing them. */
+export type Stage = "advocate" | "judge";
+
 export interface Ports {
   readonly advocate: Advocate;
   readonly judge: Judge;
   readonly log: Log;
   /** Clock for the log timestamp. Defaults to the wall clock. */
   readonly now?: () => Date;
+  /** Told which role is about to be asked, just before it is. A shell can show where the time goes. */
+  readonly onStage?: (stage: Stage) => void;
 }
 
 const JUDGE_INSTRUCTIONS = "Which Option should this person take?";
@@ -16,10 +21,12 @@ const CLOSE_CALL_THRESHOLD = 0.1;
 
 /** Takes a Dilemma and returns a Verdict or a Refusal. The Judge alone decides. */
 export async function decide(dilemma: Dilemma, ports: Ports): Promise<Outcome> {
+  ports.onStage?.("advocate");
   const argued = await ports.advocate.argue(dilemma);
   if (argued.refused) return argued;
 
   const options = withRefusalCounterpart(argued.options);
+  ports.onStage?.("judge");
   const answer = await ports.judge.judge(judgeRequest(dilemma, options));
   const verdict: Verdict = { ...answer, closeCall: isCloseCall(answer.probabilities) };
 

@@ -34,6 +34,8 @@ INDECISION_PASSPHRASE='open sesame' PORT=8080 indecision serve    # any other po
 
 `indecision serve` starts a plain HTTP server on all interfaces, on the port in `PORT` (default 3000), using the same Advocate, Judge and Log as the CLI. The page has one box for the Dilemma. Submitting it shows the Verdict first (pick, a probability per Option, confidence, and the close-call line when flagged), then every Case, expanded. A Refusal is shown as an outcome with its reason, and the Dilemma stays in the box so it can be reworded. An adapter or network failure shows as an error banner. The body is capped at 8 KiB.
 
+While a run is in progress the page shows where the time is going: "The Advocate is arguing…", then "The Judge is weighing…", then the Verdict, without reloading. The page's script posts to `/decide`, which streams one JSON line per stage and then the outcome. The Cases are never shown before the Verdict. The streamed route sits behind the same passphrase and counts toward the same run cap as the form. Without JavaScript the form posts to `/` and gets the whole page back once the run is over.
+
 `serve` is a reserved first word: `indecision serve` never starts a Dilemma. Quote it as part of a longer sentence (`indecision "serve or return?"`) and it is a Dilemma again. Nothing per-person is stored; the server appends to the same shared log file as the CLI.
 
 ### The passphrase
@@ -121,4 +123,4 @@ pnpm typecheck
 pnpm smoke       # runs the real Advocate and real Judge on a sample Dilemma; needs both keys
 ```
 
-The pipeline (`src/decide.ts`) takes the Advocate, Judge and Log as injected ports. Both shells (`src/cli.ts` and `src/serve.ts`) take an injected `decide` and are unit-tested without touching an adapter or binding a port. The real adapters live in `src/advocate`, `src/judge` and `src/log` and are covered only by the smoke script.
+The pipeline (`src/decide.ts`) takes the Advocate, Judge and Log as injected ports, plus an optional stage hook it calls just before asking each role; the CLI passes none. Both shells (`src/cli.ts` and `src/serve.ts`) take an injected `decide` and are unit-tested without touching an adapter or binding a port. The real adapters live in `src/advocate`, `src/judge` and `src/log` and are covered only by the smoke script.
