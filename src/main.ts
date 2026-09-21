@@ -6,7 +6,7 @@ import { decide, type Stage } from "./decide.js";
 import { jevJudge } from "./judge/jev.js";
 import { errorMessage } from "./format.js";
 import { jsonlLog } from "./log/jsonl.js";
-import { HOST, isServeCommand, readPort, startServer } from "./serve.js";
+import { HOST, isServeCommand, readPassphrase, readPort, startServer } from "./serve.js";
 
 let config;
 try {
@@ -34,10 +34,13 @@ if (isServeCommand(argv)) {
     process.exit(1);
   }
   try {
-    const server = await startServer({ port: readPort(process.env), decide: decideWithPorts });
+    // Both are read before the port is bound, so a misconfigured server never answers a request.
+    const passphrase = readPassphrase(process.env);
+    const port = readPort(process.env);
+    const server = await startServer({ port, passphrase, decide: decideWithPorts });
     const address = server.address();
-    const port = typeof address === "object" && address !== null ? address.port : "?";
-    process.stderr.write(`indecision: listening on http://${HOST}:${port}\n`);
+    const bound = typeof address === "object" && address !== null ? address.port : "?";
+    process.stderr.write(`indecision: listening on http://${HOST}:${bound}\n`);
     server.on("error", (error) => process.stderr.write(`indecision: ${errorMessage(error)}\n`));
   } catch (error) {
     process.stderr.write(`indecision: ${errorMessage(error)}\n`);
