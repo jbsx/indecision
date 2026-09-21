@@ -1,14 +1,14 @@
 #!/usr/bin/env node
-import { anthropicAdvocate } from "./advocate/anthropic.js";
+import { zaiAdvocate } from "./advocate/zai.js";
 import { runCli } from "./cli.js";
-import { ConfigError, loadKeys } from "./config.js";
+import { ConfigError, loadConfig } from "./config.js";
 import { decide } from "./decide.js";
 import { jevJudge } from "./judge/jev.js";
 import { jsonlLog } from "./log/jsonl.js";
 
-let keys;
+let config;
 try {
-  keys = loadKeys();
+  config = loadConfig();
 } catch (error) {
   if (!(error instanceof ConfigError)) throw error;
   process.stderr.write(`indecision: ${error.message}\n`);
@@ -16,8 +16,8 @@ try {
 }
 
 const ports = {
-  advocate: anthropicAdvocate(keys.anthropicApiKey),
-  judge: jevJudge(keys.typesafeApiKey),
+  advocate: zaiAdvocate(config.zai),
+  judge: jevJudge(config.typesafeApiKey),
   log: jsonlLog(),
 };
 

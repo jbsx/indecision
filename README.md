@@ -1,16 +1,18 @@
 # indecision
 
-A personal CLI that replaces the coin flip. You type a Dilemma; an Advocate (Anthropic's Sonnet) extracts the Options you named and writes a symmetric for-and-against Case for each without concluding; a Judge (TypeSafe AI's jev) weighs the Cases and returns a Verdict: the pick, a probability for every Option, and a confidence. Randomness never enters the Verdict. See `CONTEXT.md` for the vocabulary and `docs/adr/0001` for why the roles are split.
+A personal CLI that replaces the coin flip. You type a Dilemma; an Advocate (Z.ai's GLM) extracts the Options you named and writes a symmetric for-and-against Case for each without concluding; a Judge (TypeSafe AI's jev) weighs the Cases and returns a Verdict: the pick, a probability for every Option, and a confidence. Randomness never enters the Verdict. See `CONTEXT.md` for the vocabulary and `docs/adr/0001` for why the roles are split.
 
 ## Setup
 
 ```sh
 pnpm install
 pnpm build
-cp .env.example .env   # then fill in ANTHROPIC_API_KEY and TYPESAFE_API_KEY
+cp .env.example .env   # then fill in ZAI_API_KEY and TYPESAFE_API_KEY
 ```
 
 Keys are read from the environment, with a `.env` file in the working directory as a fallback. The tool exits with an error before any network call if either key is missing.
+
+The Advocate defaults to `glm-5.3` on Z.ai's GLM Coding Plan endpoint. Set `ZAI_BASE_URL=https://api.z.ai/api/paas/v4` for a pay-as-you-go key, and `ZAI_MODEL` to pick another GLM model.
 
 ## Use
 

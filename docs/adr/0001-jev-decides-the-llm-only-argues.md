@@ -4,7 +4,7 @@ status: accepted
 
 # Jev decides; the language model only argues
 
-The tool exists to give a decision the user can trust more than a coin flip. A generative LLM could both argue and pick, which would be cheaper and single-vendor, but an LLM's pick is a persuasive essay and the user would be back to deciding whether to believe it. We split the roles instead: a generative model (Anthropic) is the Advocate and writes a symmetric for-and-against Case per Option without ever concluding, and jev (TypeSafe AI's calibrated decision model) is the Judge and returns the Verdict. The Cases go into jev's `state` as evidence; jev's `criteria` carries only the bare Option labels so the rubric cannot smuggle in a preference.
+The tool exists to give a decision the user can trust more than a coin flip. A generative LLM could both argue and pick, which would be cheaper and single-vendor, but an LLM's pick is a persuasive essay and the user would be back to deciding whether to believe it. We split the roles instead: a generative model (Z.ai's GLM) is the Advocate and writes a symmetric for-and-against Case per Option without ever concluding, and jev (TypeSafe AI's calibrated decision model) is the Judge and returns the Verdict. The Cases go into jev's `state` as evidence; jev's `criteria` carries only the bare Option labels so the rubric cannot smuggle in a preference.
 
 ## Considered options
 
