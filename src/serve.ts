@@ -3,21 +3,18 @@ import type { Readable } from "node:stream";
 import type { Stage } from "./decide.js";
 import type { Dilemma, Option, Outcome, Verdict } from "./domain.js";
 import { errorMessage, percent } from "./format.js";
-import { deriveUnlockKey, isPassphrase, isUnlocked, unlockCookie } from "./gate.js";
 
-/** The parts of an HTTP request the shell looks at. `cookie` is the raw Cookie header; `body` the raw stream. */
+/** The parts of an HTTP request the shell looks at. `body` is the raw stream. */
 export interface Request {
   readonly method: string;
   readonly url: string;
-  readonly cookie?: string | undefined;
   readonly body: Readable;
 }
 
-/** A whole HTML page with a status, plus any headers beyond the content type. */
+/** A whole HTML page with a status. */
 export interface Page {
   readonly status: number;
   readonly html: string;
-  readonly headers?: Readonly<Record<string, string>>;
 }
 
 /**
@@ -33,7 +30,6 @@ export type RunEvent =
 /** A run's progress, handed to `send` one event at a time as it happens. Resolves once the run is over. */
 export interface Stream {
   readonly status: number;
-  readonly headers?: Readonly<Record<string, string>>;
   readonly run: (send: (event: RunEvent) => void) => Promise<void>;
 }
 
@@ -45,27 +41,13 @@ export type Handler = (request: Request) => Promise<Reply>;
 export interface ServeDeps {
   /** The pipeline, told where the time is going through `onStage` just before each role is asked. */
   readonly decide: (dilemma: Dilemma, onStage?: (stage: Stage) => void) => Promise<Outcome>;
-  /** The one shared passphrase. Whoever knows it may spend the API keys; nobody else may. */
-  readonly passphrase: string;
   /** Cap on the request body. A Dilemma is a few sentences; anything larger is a mistake. */
   readonly maxBodyBytes?: number;
-  /** Clock for cookie expiry. Defaults to the wall clock. */
-  readonly now?: () => Date;
 }
 
 export const DEFAULT_MAX_BODY_BYTES = 8 * 1024;
 export const DEFAULT_PORT = 3000;
 
-/**
- * How many runs may be in flight across the whole server. Every run spends both API keys, and the
- * page is on the open internet, so the cap bounds what a burst of submissions can cost. Deliberately
- * a constant and not config: raising it should be a code change someone reads.
- */
-export const MAX_RUNS_IN_FLIGHT = 2;
-/** What the busy page tells the browser to wait before retrying, in seconds. */
-const BUSY_RETRY_AFTER_SECONDS = 30;
-
-const UNLOCK_PATH = "/unlock";
 /** Where the page's script sends the Dilemma. The form itself still posts to /. */
 const STREAM_PATH = "/decide";
 
@@ -83,20 +65,6 @@ export function readPort(env: NodeJS.ProcessEnv): number {
     throw new Error(`PORT must be a whole number between 0 and 65535, got "${raw}".`);
   }
   return port;
-}
-
-/**
- * The shared passphrase from `INDECISION_PASSPHRASE`. `serve` refuses to start without it, since
- * the page would otherwise let anyone on the internet spend the API keys. The CLI never needs it.
- */
-export function readPassphrase(env: NodeJS.ProcessEnv): string {
-  const passphrase = env["INDECISION_PASSPHRASE"]?.trim() ?? "";
-  if (passphrase === "") {
-    throw new Error(
-      "INDECISION_PASSPHRASE is not set. `serve` refuses to start without a passphrase; set it in the environment or in a .env file in the working directory.",
-    );
-  }
-  return passphrase;
 }
 
 /** All interfaces, so the page is reachable from another device on the network. */
@@ -118,12 +86,6 @@ interface Rejection {
   readonly reason: string;
 }
 
-const BUSY: Rejection = {
-  status: 503,
-  reason: "The server is busy deciding for someone else; try again in a moment.",
-};
-const RETRY_AFTER = { "Retry-After": String(BUSY_RETRY_AFTER_SECONDS) };
-
 /** A thrown failure (adapter, network), worded for the person. Nothing was decided. */
 function somethingWentWrong(error: unknown): string {
   return `Something went wrong: ${errorMessage(error)}`;
@@ -142,7 +104,6 @@ export function startServer({ port, ...deps }: ServeOptions): Promise<Server> {
       reply = await handle({
         method: req.method ?? "GET",
         url: req.url ?? "/",
-        cookie: req.headers.cookie,
         body: req,
       });
     } catch (error) {
@@ -151,19 +112,16 @@ export function startServer({ port, ...deps }: ServeOptions): Promise<Server> {
     }
     if ("html" in reply) {
       if (res.writableEnded || res.destroyed) return;
-      res.writeHead(reply.status, { "Content-Type": HTML_TYPE, ...reply.headers });
+      res.writeHead(reply.status, { "Content-Type": HTML_TYPE });
       res.end(req.method === "HEAD" ? undefined : reply.html);
       return;
     }
-    if (!res.destroyed) {
-      res.writeHead(reply.status, {
-        "Content-Type": NDJSON_TYPE,
-        "Cache-Control": "no-store",
-        ...reply.headers,
-      });
-      res.flushHeaders();
-    }
-    // Always run, even for a client that has gone: the run may hold a slot under the cap to give back.
+    if (res.destroyed) return;
+    res.writeHead(reply.status, {
+      "Content-Type": NDJSON_TYPE,
+      "Cache-Control": "no-store",
+    });
+    res.flushHeaders();
     await reply.run((event) => {
       if (!res.destroyed) res.write(JSON.stringify(event) + "\n");
     });
@@ -179,52 +137,23 @@ export function startServer({ port, ...deps }: ServeOptions): Promise<Server> {
 }
 
 /**
- * Thin shell over `decide`: one page with a box for the Dilemma, the Outcome rendered below it,
- * behind a passphrase page that everyone shares. One handler serves every request. The page's
- * script posts to the streamed route instead of the form's own, and gets the stages as they happen.
+ * Thin shell over `decide`: one page with a box for the Dilemma, the Outcome rendered below it.
+ * One handler serves every request. The page's script posts to the streamed route instead of the
+ * form's own, and gets the stages as they happen.
  */
 export function createHandler(deps: ServeDeps): Handler {
   const maxBodyBytes = deps.maxBodyBytes ?? DEFAULT_MAX_BODY_BYTES;
-  const now = deps.now ?? (() => new Date());
-  const key = deriveUnlockKey(deps.passphrase);
-  let runsInFlight = 0;
-
-  /** Takes a slot under the cap, or none when the server is busy. What comes back gives the slot up. */
-  const takeSlot = (): (() => void) | undefined => {
-    if (runsInFlight >= MAX_RUNS_IN_FLIGHT) return undefined;
-    runsInFlight += 1;
-    let given = false;
-    return () => {
-      if (given) return;
-      given = true;
-      runsInFlight -= 1;
-    };
-  };
 
   return async (request) => {
     const path = new URL(request.url, "http://localhost").pathname;
-    if (path === UNLOCK_PATH) {
-      if (request.method !== "POST") return failure(405, "Enter the passphrase with the form.");
-      const form = await readBody(request.body, maxBodyBytes);
-      if (form === undefined) return failure(413, "That is far too long to be the passphrase.");
-      const offered = new URLSearchParams(form).get("passphrase")?.trim() ?? "";
-      if (!(await isPassphrase(offered, await key))) return passphrasePage("Wrong passphrase.");
-      const headers = { Location: "/", "Set-Cookie": unlockCookie(await key, now()) };
-      return { status: 303, html: "", headers };
-    }
     if (path !== "/" && path !== STREAM_PATH) {
       return failure(404, "There is nothing at that address; the page is at /.");
     }
-
-    // The script falls back to the form's own POST when it gets a page instead of a Stream here.
-    if (!isUnlocked(request.cookie, await key, now())) return passphrasePage();
 
     if (path === STREAM_PATH) {
       if (request.method !== "POST") return failure(405, NOT_A_FORM_POST);
       const submitted = await readDilemma(request.body, maxBodyBytes);
       if ("reason" in submitted) return turnedAway(submitted);
-      const giveBack = takeSlot();
-      if (giveBack === undefined) return { ...turnedAway(BUSY), headers: RETRY_AFTER };
       return {
         status: 200,
         run: async (send) => {
@@ -235,8 +164,6 @@ export function createHandler(deps: ServeDeps): Handler {
             send({ outcome: renderOutcome(outcome) });
           } catch (error) {
             send({ error: renderError(somethingWentWrong(error)) });
-          } finally {
-            giveBack();
           }
         },
       };
@@ -249,16 +176,10 @@ export function createHandler(deps: ServeDeps): Handler {
     if ("reason" in submitted) return failure(submitted.status, submitted.reason);
     const { dilemma } = submitted;
 
-    const giveBack = takeSlot();
-    if (giveBack === undefined) {
-      return { ...failure(BUSY.status, BUSY.reason, dilemma), headers: RETRY_AFTER };
-    }
     try {
       return page({ dilemma, outcome: await deps.decide(dilemma) });
     } catch (error) {
       return failure(500, somethingWentWrong(error), dilemma);
-    } finally {
-      giveBack();
     }
   };
 }
@@ -321,36 +242,9 @@ function turnedAway(rejection: Rejection): Stream {
   return { status: rejection.status, run: async (send) => send({ error: banner }) };
 }
 
-/** The page anyone without a valid cookie sees. 401: the request is understood, the visitor is not. */
-function passphrasePage(error?: string): Page {
-  const banner = error === undefined ? "" : renderError(error);
-  return {
-    status: 401,
-    html: frame(`${banner}<form method="post" action="${UNLOCK_PATH}">
-<label for="passphrase">Passphrase</label>
-<input type="password" name="passphrase" id="passphrase" autofocus required>
-<button type="submit">Enter</button>
-</form>
-`),
-  };
-}
-
 function renderPage(state: PageState): string {
   const banner = state.error === undefined ? "" : renderError(state.error);
   const renderedOutcome = state.outcome === undefined ? "" : renderOutcome(state.outcome);
-  return frame(`<div id="banner">${banner}</div>
-<form method="post" action="/">
-<label for="dilemma">What are you stuck on?</label>
-<textarea name="dilemma" id="dilemma" rows="5" required>${escape(state.dilemma)}</textarea>
-<button type="submit">Decide</button>
-<p class="waiting" hidden aria-live="polite">Deciding…</p>
-</form>
-<div id="outcome">${renderedOutcome}</div>
-`);
-}
-
-/** The document around either page's main content. */
-function frame(main: string): string {
   return `<!doctype html>
 <html lang="en">
 <head>
@@ -362,7 +256,15 @@ function frame(main: string): string {
 <body>
 <main>
 <h1>indecision</h1>
-${main}</main>
+<div id="banner">${banner}</div>
+<form method="post" action="/">
+<label for="dilemma">What are you stuck on?</label>
+<textarea name="dilemma" id="dilemma" rows="5" required>${escape(state.dilemma)}</textarea>
+<button type="submit">Decide</button>
+<p class="waiting" hidden aria-live="polite">Deciding…</p>
+</form>
+<div id="outcome">${renderedOutcome}</div>
+</main>
 <script>${SCRIPT}</script>
 </body>
 </html>
@@ -373,7 +275,7 @@ const STYLE = `
 body { font: 16px/1.5 system-ui, sans-serif; margin: 0; background: #fafafa; color: #222; }
 main { max-width: 40rem; margin: 0 auto; padding: 1rem; }
 label { display: block; font-weight: 600; margin-bottom: .25rem; }
-textarea, input[type="password"] { width: 100%; box-sizing: border-box; font: inherit; padding: .5rem; }
+textarea { width: 100%; box-sizing: border-box; font: inherit; padding: .5rem; }
 button { font: inherit; padding: .5rem 1.25rem; margin-top: .5rem; }
 .error { background: #fde8e8; border: 1px solid #d33; padding: .75rem; }
 .refusal { background: #fff6e0; border: 1px solid #d9a400; padding: .75rem 1rem; }
@@ -388,8 +290,8 @@ ul { margin: .25rem 0; }
 
 /**
  * On the Dilemma page, submits to the streamed route and shows each stage as it arrives, then the
- * outcome or the banner, without reloading. On the passphrase page, or without fetch, or when the
- * server answers with a page instead of a Stream (the unlock has expired), the form posts itself.
+ * outcome or the banner, without reloading. Without fetch, or when the server answers with a page
+ * instead of a Stream, the form posts itself.
  */
 const SCRIPT = `
 (function () {
