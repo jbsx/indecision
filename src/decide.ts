@@ -21,17 +21,32 @@ const CLOSE_CALL_THRESHOLD = 0.1;
 
 /** Takes a Dilemma and returns a Verdict or a Refusal. The Judge alone decides. */
 export async function decide(dilemma: Dilemma, ports: Ports): Promise<Outcome> {
+  const now = ports.now ?? (() => new Date());
+
   ports.onStage?.("advocate");
   const argued = await ports.advocate.argue(dilemma);
-  if (argued.refused) return argued;
+  if (argued.refused) {
+    await ports.log.append({
+      refused: true,
+      dilemma,
+      reason: argued.reason,
+      timestamp: now().toISOString(),
+    });
+    return argued;
+  }
 
   const options = withRefusalCounterpart(argued.options);
   ports.onStage?.("judge");
   const answer = await ports.judge.judge(judgeRequest(dilemma, options));
   const verdict: Verdict = { ...answer, closeCall: isCloseCall(answer.probabilities) };
 
-  const timestamp = (ports.now ?? (() => new Date()))().toISOString();
-  await ports.log.append({ dilemma, options, verdict, timestamp });
+  await ports.log.append({
+    refused: false,
+    dilemma,
+    options,
+    verdict,
+    timestamp: now().toISOString(),
+  });
 
   return { refused: false, options, verdict };
 }

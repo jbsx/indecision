@@ -27,7 +27,7 @@ export async function runCli(io: CliIo): Promise<number> {
   }
 
   if (outcome.refused) {
-    io.stderr.write(`Can't decide this one: ${outcome.reason}\n`);
+    io.stderr.write(`No choice to argue here: ${outcome.reason}\n`);
     return 1;
   }
 

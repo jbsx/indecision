@@ -355,13 +355,13 @@ function renderError(message: string): string {
 `;
 }
 
-/** A Refusal is a normal outcome: the Dilemma named no Options, so reword it and try again. */
+/** A Refusal is a normal outcome: the input described no choice, so reword it and try again. */
 function renderOutcome(outcome: Outcome): string {
   if (outcome.refused) {
     return `<section class="refusal">
-<h2>Can't decide this one</h2>
+<h2>No choice to argue here</h2>
 <p>${escape(outcome.reason)}</p>
-<p>Reword the Dilemma above so it names the Options, then try again.</p>
+<p>Reword the Dilemma above so it describes a choice, then try again.</p>
 </section>
 `;
   }

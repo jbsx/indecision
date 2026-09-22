@@ -80,6 +80,6 @@ describe("indecision CLI", () => {
 
     expect(code).toBe(1);
     expect(stdout).toBe("");
-    expect(stderr).toContain("No Options are named.");
+    expect(stderr).toContain("No choice to argue here: No Options are named.");
   });
 });

@@ -1,6 +1,6 @@
 # indecision
 
-A personal CLI that replaces the coin flip. You type a Dilemma; an Advocate (Z.ai's GLM) extracts the Options you named and writes a symmetric for-and-against Case for each without concluding; a Judge (TypeSafe AI's jev) weighs the Cases and returns a Verdict: the pick, a probability for every Option, and a confidence. Randomness never enters the Verdict. See `CONTEXT.md` for the vocabulary and `docs/adr/0001` for why the roles are split.
+A personal CLI that replaces the coin flip. You type a Dilemma; an Advocate (Z.ai's GLM) reads the Options out of it, stated or implied, and writes a symmetric for-and-against Case for each without concluding; a Judge (TypeSafe AI's jev) weighs the Cases and returns a Verdict: the pick, a probability for every Option, and a confidence. Randomness never enters the Verdict. See `CONTEXT.md` for the vocabulary and `docs/adr/0001` for why the roles are split.
 
 ## Setup
 
@@ -23,7 +23,7 @@ echo "gym or rest?" | node dist/main.js
 
 `pnpm link --global` puts the same entry point on your PATH as `indecision`.
 
-The Verdict is printed first, then the Cases. A close call is flagged when the top two probabilities are within 0.1 of each other. Every successful run is appended as one JSON line to `indecision/log.jsonl` under your user data directory (`$XDG_DATA_HOME` on Linux, defaulting to `~/.local/share`).
+The Verdict is printed first, then the Cases. A close call is flagged when the top two probabilities are within 0.1 of each other. Every run is appended as one JSON line to `indecision/log.jsonl`, the Verdict with its Cases or the Refusal with its reason, under your user data directory (`$XDG_DATA_HOME` on Linux, defaulting to `~/.local/share`).
 
 ## Use from a browser
 
@@ -32,7 +32,7 @@ indecision serve              # listens on 0.0.0.0:3000
 PORT=8080 indecision serve    # any other port
 ```
 
-`indecision serve` starts a plain HTTP server on all interfaces, on the port in `PORT` (default 3000), using the same Advocate, Judge and Log as the CLI and needing nothing beyond the two API keys. The page has one box for the Dilemma. Submitting it shows the Verdict first (pick, a probability per Option, confidence, and the close-call line when flagged), then every Case, expanded. A Refusal is shown as an outcome with its reason, and the Dilemma stays in the box so it can be reworded. An adapter or network failure shows as an error banner. The body is capped at 8 KiB. Several submissions may be in flight at once; each is decided.
+`indecision serve` starts a plain HTTP server on all interfaces, on the port in `PORT` (default 3000), using the same Advocate, Judge and Log as the CLI and needing nothing beyond the two API keys. The page has one box for the Dilemma. Submitting it shows the Verdict first (pick, a probability per Option, confidence, and the close-call line when flagged), then every Case, expanded. A Refusal (the input described no choice, stated or implied) is shown as an outcome with its reason, and the Dilemma stays in the box so it can be reworded. An adapter or network failure shows as an error banner. The body is capped at 8 KiB. Several submissions may be in flight at once; each is decided.
 
 While a run is in progress the page shows where the time is going: "The Advocate is arguing…", then "The Judge is weighing…", then the Verdict, without reloading. The page's script posts to `/decide`, which streams one JSON line per stage and then the outcome. The Cases are never shown before the Verdict. Without JavaScript the form posts to `/` and gets the whole page back once the run is over.
 

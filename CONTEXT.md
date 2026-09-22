@@ -9,8 +9,8 @@ The raw natural-language utterance describing a choice the user is stuck on, exa
 _Avoid_: situation, prompt, question, input
 
 **Option**:
-One candidate the user could choose. An Option is only ever stated by the user, never invented, with one exception: a Dilemma that names a single Option implies its refusal ("don't") as the second.
-_Avoid_: choice, candidate, alternative, case
+One candidate the user could choose. An Option is stated by the user or plainly implied by the Dilemma: a complaint implies acting on it or not, a lone Option implies its refusal ("don't"), a trailing "or… something" implies the unnamed alternative. The Advocate reads implied Options out of the Dilemma; it never proposes an alternative the user gave no sign of considering.
+_Avoid_: choice, candidate, alternative, case, suggestion
 
 **Case**:
 The argument for and against one Option. Written by an advocate that must argue every Option with equal effort and must not conclude.
@@ -27,6 +27,10 @@ _Avoid_: model, oracle, AI
 **Verdict**:
 The Judge's pick, together with a probability for every Option and a confidence in the pick. A close Verdict is still a Verdict.
 _Avoid_: decision, result, answer, flip
+
+**Refusal**:
+The Advocate declining to argue because the input is not a Dilemma at all: it describes no choice, stated or implied. Never because the Options are left unstated. The Judge is never asked, so a Refusal is not a failed Verdict.
+_Avoid_: error, can't decide, no answer
 
 **Close call**:
 A Verdict whose probabilities are nearly even. Reported as such; never resolved by randomness.

@@ -22,7 +22,7 @@ export interface Verdict {
   readonly closeCall: boolean;
 }
 
-/** The Advocate declined to argue because the Dilemma names no Options. */
+/** The Advocate declined to argue because the input describes no choice, stated or implied. */
 export interface Refusal {
   readonly refused: true;
   readonly reason: string;
