@@ -116,12 +116,10 @@ export function startServer({ port, ...deps }: ServeOptions): Promise<Server> {
       res.end(req.method === "HEAD" ? undefined : reply.html);
       return;
     }
-    if (res.destroyed) return;
-    res.writeHead(reply.status, {
-      "Content-Type": NDJSON_TYPE,
-      "Cache-Control": "no-store",
-    });
-    res.flushHeaders();
+    if (!res.destroyed) {
+      res.writeHead(reply.status, { "Content-Type": NDJSON_TYPE, "Cache-Control": "no-store" });
+      res.flushHeaders();
+    }
     await reply.run((event) => {
       if (!res.destroyed) res.write(JSON.stringify(event) + "\n");
     });
@@ -291,7 +289,7 @@ ul { margin: .25rem 0; }
 /**
  * On the Dilemma page, submits to the streamed route and shows each stage as it arrives, then the
  * outcome or the banner, without reloading. Without fetch, or when the server answers with a page
- * instead of a Stream, the form posts itself.
+ * instead of a Stream (only an unexpected failure in the handler does), the form posts itself.
  */
 const SCRIPT = `
 (function () {
