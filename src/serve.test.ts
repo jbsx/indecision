@@ -234,6 +234,7 @@ describe("indecision serve", () => {
     }));
 
     expect(reply.status).toBe(200);
+    expect(reply.html).toContain("No choice to argue here");
     expect(reply.html).toContain("No Options are named.");
     expect(reply.html).toContain(">I feel stuck &amp; &lt;lost&gt;</textarea>");
     expect(reply.html).not.toContain("Verdict");

@@ -94,18 +94,30 @@ describe("decide", () => {
     });
   });
 
-  it("returns the Advocate's Refusal without calling the Judge or logging", async () => {
+  it("returns the Advocate's Refusal without calling the Judge, and logs it", async () => {
     const judge = recordingJudge(peaked);
     const log = recordingLog();
     const advocate: Advocate = {
-      argue: async () => ({ refused: true, reason: "No Options are named." }),
+      argue: async () => ({ refused: true, reason: "That is a greeting, not a choice." }),
     };
 
-    const outcome = await decide("I feel stuck", { advocate, judge, log });
+    const outcome = await decide("hello", {
+      advocate,
+      judge,
+      log,
+      now: () => new Date("2026-09-22T09:00:00.000Z"),
+    });
 
-    expect(outcome).toEqual({ refused: true, reason: "No Options are named." });
+    expect(outcome).toEqual({ refused: true, reason: "That is a greeting, not a choice." });
     expect(judge.requests).toEqual([]);
-    expect(log.entries).toEqual([]);
+    expect(log.entries).toEqual([
+      {
+        refused: true,
+        dilemma: "hello",
+        reason: "That is a greeting, not a choice.",
+        timestamp: "2026-09-22T09:00:00.000Z",
+      },
+    ]);
   });
 
   it("passes a peaked Verdict through unchanged and does not flag a close call", async () => {
@@ -170,6 +182,7 @@ describe("decide", () => {
 
     expect(log.entries).toEqual([
       {
+        refused: false,
         dilemma: "gym or rest?",
         options: [gym, rest],
         verdict: { ...peaked, closeCall: false },

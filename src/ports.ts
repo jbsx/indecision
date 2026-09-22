@@ -27,13 +27,25 @@ export interface Judge {
   judge(request: JudgeRequest): Promise<UnflaggedVerdict>;
 }
 
-/** One record per successful run. */
-export interface LogEntry {
+/** One record per run that reached a Verdict. */
+export interface VerdictEntry {
+  readonly refused: false;
   readonly dilemma: Dilemma;
   readonly options: readonly Option[];
   readonly verdict: Verdict;
   readonly timestamp: string;
 }
+
+/** One record per Refusal, so an over-strict Advocate leaves evidence. */
+export interface RefusalEntry {
+  readonly refused: true;
+  readonly dilemma: Dilemma;
+  readonly reason: string;
+  readonly timestamp: string;
+}
+
+/** One record per run, whether it reached a Verdict or was refused. */
+export type LogEntry = VerdictEntry | RefusalEntry;
 
 export interface Log {
   append(entry: LogEntry): Promise<void>;
